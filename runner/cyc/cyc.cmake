@@ -124,7 +124,7 @@ function(nesrecomp_cyc_enable_sdl target)
     endif()
     target_sources(${target} PRIVATE ${NESRECOMP_CYC_DIR}/cyc_sdl.c ${NESRECOMP_CYC_DIR}/cyc_input.c
         ${NESRECOMP_CYC_DIR}/cyc_settings.c ${NESRECOMP_CYC_DIR}/cyc_tcp.c ${NESRECOMP_CYC_DIR}/cyc_shader.c
-        ${NESRECOMP_CYC_DIR}/cyc_touch.c)
+        ${NESRECOMP_CYC_DIR}/cyc_touch.c ${NESRECOMP_CYC_DIR}/cyc_chat.c)
     # The bundled GLSL shaders (cyc_shader.h), where the launcher lists presets.
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory ${NESRECOMP_CYC_DIR}/shaders
