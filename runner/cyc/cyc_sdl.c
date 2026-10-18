@@ -742,6 +742,28 @@ static void tcp_hle(int id, const char *line)
     cyc_tcp_err(id, "hle: unknown axis");
 }
 
+/* Poke CPU RAM through the mods' path (cyc_mod_poke: RAM or work RAM, as a
+ * CPU store would), between frames: addr, hex ("0203" writes 02 then 03). */
+static void tcp_write_ram(int id, const char *line)
+{
+    long addr = -1;
+    char hex[512];
+    if (!cyc_tcp_long(line, "addr", &addr) || !cyc_tcp_str(line, "hex", hex, sizeof(hex)) || addr < 0 ||
+        strlen(hex) % 2 || addr + (long)strlen(hex) / 2 > 0x10000) {
+        cyc_tcp_err(id, "write_ram: addr, hex (pairs of hex digits)");
+        return;
+    }
+    for (size_t i = 0; hex[i]; i += 2) {
+        char pair[3] = { hex[i], hex[i + 1], 0 }, *end;
+        long v = strtol(pair, &end, 16);
+        if (*end || !cyc_mod_poke((uint16_t)(addr + (long)i / 2), (uint8_t)v)) {
+            cyc_tcp_err(id, "write_ram: not hex, or not RAM");
+            return;
+        }
+    }
+    cyc_tcp_ok(id, NULL);
+}
+
 static void tcp_read_ram(int id, const char *line)
 {
     long addr = 0, len = 1;
@@ -938,6 +960,7 @@ static void tcp_setup(void)
     cyc_tcp_register("hle", "an HLE axis as the menu sets it: axis, value on|off|default", tcp_hle);
     cyc_tcp_register("screenshot", "layer picture (the game) | ui (what the window presents), path", tcp_screenshot);
     cyc_tcp_register("read_ram", "CPU address space bytes: addr, len", tcp_read_ram);
+    cyc_tcp_register("write_ram", "store CPU RAM bytes as the CPU would: addr, hex", tcp_write_ram);
     cyc_tcp_register("ring_dump", "the always-on event ring to a file: path, first, last", tcp_ring);
     cyc_tcp_register("save_state", "write a save state (cyc_state.h): path", tcp_save_state);
     cyc_tcp_register("load_state", "load a save state: path", tcp_load_state);
