@@ -118,3 +118,52 @@ test('every message is shown in the chat panel, commands included', async () => 
   const chat = game.sent.filter(([c]) => c === 'chat').map(([, f]) => f.text);
   assert.deepEqual(chat, ['hello there', '!commands', 'COMMANDS: !star !grow !big']);
 });
+
+const voteProfile = {
+  ...profile,
+  vote: { mode: 'vote', options: 3, pool: ['star', 'grow', 'big'], duration_ms: 20000 },
+};
+
+test('a vote round: one vote per viewer, the winner runs past its cooldown', async () => {
+  let t = 100000;
+  const game = fakeGame({ 0x0770: 1, 0x0756: 0 });
+  const e = createEngine(voteProfile, { game, now: () => t, random: () => 0 });
+  assert.deepEqual(await e.startVote(), ['star', 'grow', 'big']);
+  assert.equal((await e.handle(viewer('ann', '2'))).voted, true);
+  await e.handle(viewer('bob', '!vote 2'));
+  await e.handle(viewer('cat', '1'));
+  await e.handle(viewer('cat', '!star'));       // a command on the ballot is a vote too; cat stays on 1
+  await e.handle(viewer('ann', '3'));           // ann changes her mind
+  await e.handle(viewer('dan', '7'));           // no such option: plain chat
+  const poll = game.sent.filter(([c]) => c === 'chat_poll').at(-1)[1];
+  assert.equal(poll.options, 'STAR|GROW|BIG');
+  assert.deepEqual(game.sent.filter(([c]) => c === 'chat').map(([, f]) => f.text), ['7']); // votes show in the poll only
+  const r = await e.finishVote();
+  assert.deepEqual(r, { winner: 'star', votes: [1, 1, 1] }); // a three-way tie, broken by random()
+  assert.ok(game.sent.some(([c, f]) => c === 'chat_banner' && /^CHAT CHOSE /.test(f.text)));
+});
+
+test('the most voted option that can run now wins; vote mode keeps viewers off direct commands', async () => {
+  const game = fakeGame({ 0x0770: 0, 0x0756: 0 });      // not playing: !star cannot run
+  const e = createEngine(voteProfile, { game, now: () => 0, random: () => 0 });
+  await e.startVote();
+  await e.handle(viewer('ann', '1'));
+  await e.handle(viewer('bob', '1'));
+  await e.handle(viewer('cat', '2'));
+  const r = await e.finishVote();
+  assert.equal(r.winner, 'grow');
+  assert.deepEqual(game.sent.filter(([c]) => c === 'chat_ram').at(-1)[1], { addr: 0x0756, set: 1 });
+  assert.equal((await e.handle(viewer('eve', '!grow'))).why, 'vote mode: commands win by vote');
+  assert.deepEqual(await e.handle(viewer('mo', '!vote off', { mod: true })), { vote: 'off' });
+  assert.equal(e.voting, false);
+  assert.equal(await e.handle(viewer('eve', '!vote on')), null); // viewers cannot switch it
+  assert.equal(e.voting, false);
+});
+
+test('no votes: nothing runs', async () => {
+  const game = fakeGame({ 0x0770: 1 });
+  const e = createEngine(voteProfile, { game, now: () => 0, random: () => 0.5 });
+  await e.startVote();
+  assert.deepEqual(await e.finishVote(), { winner: null, votes: [0, 0, 0] });
+  assert.equal(game.sent.filter(([c]) => c === 'chat_ram').length, 0);
+});

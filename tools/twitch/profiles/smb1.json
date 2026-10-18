@@ -2,6 +2,15 @@
   "name": "Super Mario Bros.",
   "prefix": "!",
   "chat": { "side": "left", "valign": "top", "offset": 18, "lines": 6, "ms": 20000 },
+  "vote": {
+    "mode": "both",
+    "options": 3,
+    "duration_ms": 20000,
+    "gap_ms": 15000,
+    "y": 22,
+    "title": "CHAT VOTE",
+    "pool": ["star", "powerup", "shrink", "oneup", "time", "hurry", "moon", "hop", "run", "invert", "nojump", "freeze"]
+  },
   "cooldown_ms": 1500,
   "user_cooldown_ms": 8000,
   "command_cooldown_ms": 10000,
@@ -21,6 +30,7 @@
   "rewards": {},
   "commands": {
     "star": {
+      "title": "STAR POWER",
       "help": "star power (as the Starman does: StarInvincibleTimer, star music)",
       "cooldown_ms": 60000,
       "when": "playing",
@@ -31,6 +41,7 @@
       ]
     },
     "powerup": {
+      "title": "POWER-UP",
       "help": "small -> super, super -> fire (the game's own change-size / fire-flower routines)",
       "cooldown_ms": 30000,
       "variants": [
@@ -70,6 +81,7 @@
       ]
     },
     "shrink": {
+      "title": "SHRINK MARIO",
       "help": "hurt Mario one size (the game's injury: shrink, blink, never a death)",
       "cooldown_ms": 45000,
       "when": [
@@ -92,6 +104,7 @@
       ]
     },
     "oneup": {
+      "title": "1-UP",
       "help": "an extra life (up to 9 shown)",
       "cooldown_ms": 120000,
       "when": "playing",
@@ -102,6 +115,7 @@
       ]
     },
     "time": {
+      "title": "+100 TIME",
       "help": "+100 on the clock (hundreds digit, up to 9)",
       "cooldown_ms": 60000,
       "when": "playing",
@@ -111,6 +125,7 @@
       ]
     },
     "hurry": {
+      "title": "-100 TIME",
       "help": "-100 on the clock (never below 100)",
       "cooldown_ms": 90000,
       "when": "playing",
@@ -120,6 +135,7 @@
       ]
     },
     "moon": {
+      "title": "MOON GRAVITY",
       "help": "10 s of low gravity (VerticalForce / VerticalForceDown held low)",
       "cooldown_ms": 45000,
       "when": "playing",
@@ -137,6 +153,7 @@
       ]
     },
     "hop": {
+      "title": "BUNNY HOP",
       "help": "5 s of bunny hops",
       "cooldown_ms": 30000,
       "when": "playing",
@@ -161,6 +178,7 @@
       ]
     },
     "run": {
+      "title": "TURBO RUN",
       "help": "5 s of B held (run / fireballs)",
       "cooldown_ms": 20000,
       "when": "playing",
@@ -181,6 +199,7 @@
       ]
     },
     "invert": {
+      "title": "REVERSED",
       "help": "10 s of left and right swapped",
       "cooldown_ms": 60000,
       "when": "playing",
@@ -189,6 +208,7 @@
       ]
     },
     "nojump": {
+      "title": "NO JUMPING",
       "help": "5 s without jumping",
       "cooldown_ms": 60000,
       "when": "playing",
@@ -197,6 +217,7 @@
       ]
     },
     "freeze": {
+      "title": "FREEZE",
       "help": "1.5 s with no input at all",
       "cooldown_ms": 45000,
       "when": "playing",
