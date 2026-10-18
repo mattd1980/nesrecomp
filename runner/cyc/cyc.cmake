@@ -110,14 +110,19 @@ set(NESRECOMP_CYC_HELPER_TEST_SOURCES ${NESRECOMP_CYC_DIR}/cyc_helper_test.c)
 # provides (it is in NESRECOMP_CYC_SOURCES and gives way to a definition).
 function(nesrecomp_cyc_enable_sdl target)
     cmake_parse_arguments(SDLOPT "DEV_UI;NO_DEV_UI" "" "" ${ARGN})
-    list(APPEND CMAKE_PREFIX_PATH "${NESRECOMP_CYC_DIR}/../external/SDL2/cmake")
-    find_package(SDL2 CONFIG QUIET)
+    if(TARGET SDL2::SDL2)
+        set(SDL2_FOUND TRUE)         # built from source by the parent (Android)
+    else()
+        list(APPEND CMAKE_PREFIX_PATH "${NESRECOMP_CYC_DIR}/../external/SDL2/cmake")
+        find_package(SDL2 CONFIG QUIET)
+    endif()
     if(NOT SDL2_FOUND)
         message(STATUS "${target}: SDL2 not found, building headless only")
         return()
     endif()
     target_sources(${target} PRIVATE ${NESRECOMP_CYC_DIR}/cyc_sdl.c ${NESRECOMP_CYC_DIR}/cyc_input.c
-        ${NESRECOMP_CYC_DIR}/cyc_settings.c ${NESRECOMP_CYC_DIR}/cyc_tcp.c ${NESRECOMP_CYC_DIR}/cyc_shader.c)
+        ${NESRECOMP_CYC_DIR}/cyc_settings.c ${NESRECOMP_CYC_DIR}/cyc_tcp.c ${NESRECOMP_CYC_DIR}/cyc_shader.c
+        ${NESRECOMP_CYC_DIR}/cyc_touch.c)
     # The bundled GLSL shaders (cyc_shader.h), where the launcher lists presets.
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory ${NESRECOMP_CYC_DIR}/shaders

@@ -67,6 +67,7 @@
 #include "cyc_session.h"
 #include "cyc_settings.h"
 #include "cyc_shader.h"
+#include "cyc_touch.h"
 #ifdef NESRECOMP_CYCLE_HDPACK
 #include "cyc_hdpack.h"
 #endif
@@ -378,7 +379,11 @@ static void apply_settings(void)
 {
     if (!s_win) return;
     apply_shader();
+#ifdef __ANDROID__
+    Uint32 fs = SDL_WINDOW_FULLSCREEN_DESKTOP;   /* the window is the screen; a windowed size would only shrink the picture */
+#else
     Uint32 fs = s_set.fullscreen == 1 ? SDL_WINDOW_FULLSCREEN_DESKTOP : s_set.fullscreen == 2 ? SDL_WINDOW_FULLSCREEN : 0;
+#endif
     if ((SDL_GetWindowFlags(s_win) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != fs)
         SDL_SetWindowFullscreen(s_win, fs);
     if (!fs) SDL_SetWindowSize(s_win, s_tex_w * s_set.window_scale, logical_h() * s_set.window_scale);
@@ -764,6 +769,33 @@ static void tcp_write_ram(int id, const char *line)
     cyc_tcp_ok(id, NULL);
 }
 
+/* A finger on the window, as SDL delivers a real one (cyc_touch.h):
+ * finger (id), x and y in thousandths of the window, down true|false. */
+static void tcp_touch(int id, const char *line)
+{
+    long finger = 0, x = -1, y = -1;
+    bool down = true;
+    cyc_tcp_long(line, "finger", &finger);
+    cyc_tcp_bool(line, "down", &down);
+    if (!cyc_tcp_long(line, "x", &x) || !cyc_tcp_long(line, "y", &y) || x < 0 || x > 1000 || y < 0 || y > 1000) {
+        cyc_tcp_err(id, "touch: x, y in 0..1000 (thousandths of the window), finger, down");
+        return;
+    }
+    SDL_Event e;
+    SDL_zero(e);
+    e.type = down ? SDL_FINGERDOWN : SDL_FINGERUP;
+    e.tfinger.touchId = 1;
+    e.tfinger.fingerId = (SDL_FingerID)finger;
+    e.tfinger.x = (float)x / 1000.0f;
+    e.tfinger.y = (float)y / 1000.0f;
+    e.tfinger.pressure = down ? 1.0f : 0.0f;
+    e.tfinger.windowID = s_win ? SDL_GetWindowID(s_win) : 0;
+    SDL_PushEvent(&e);
+    char f[64];
+    snprintf(f, sizeof(f), "\"enabled\":%s", cyc_touch_enabled() ? "true" : "false");
+    cyc_tcp_ok(id, f);
+}
+
 static void tcp_read_ram(int id, const char *line)
 {
     long addr = 0, len = 1;
@@ -961,6 +993,7 @@ static void tcp_setup(void)
     cyc_tcp_register("screenshot", "layer picture (the game) | ui (what the window presents), path", tcp_screenshot);
     cyc_tcp_register("read_ram", "CPU address space bytes: addr, len", tcp_read_ram);
     cyc_tcp_register("write_ram", "store CPU RAM bytes as the CPU would: addr, hex", tcp_write_ram);
+    cyc_tcp_register("touch", "a finger on the window: x, y (0..1000), finger, down", tcp_touch);
     cyc_tcp_register("ring_dump", "the always-on event ring to a file: path, first, last", tcp_ring);
     cyc_tcp_register("save_state", "write a save state (cyc_state.h): path", tcp_save_state);
     cyc_tcp_register("load_state", "load a save state: path", tcp_load_state);
@@ -1146,6 +1179,7 @@ static void show(bool loading, const char *toast_title, const char *toast_body)
 #else
     (void)loading;
 #endif
+    if (!menu_open()) cyc_touch_draw(s_ren);                    /* on-screen controls, under the menu */
 #ifdef CYC_WITH_RECOMP_UI
     cyc_ui_render();
 #endif
@@ -1252,6 +1286,7 @@ int cyc_sdl_main(const char *title_in, int scale)
         return 1;
     }
     if (!s_set_path[0]) cyc_settings_default(&s_set);   /* prelaunch did not run */
+    cyc_touch_init();
     if (scale > 0) s_set.window_scale = scale;
     s_fds = cyc_is_fds();
 #ifdef CYC_DEV_UI
@@ -1263,7 +1298,12 @@ int cyc_sdl_main(const char *title_in, int scale)
     s_tex_h = h;
     s_win = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w * s_set.window_scale,
                              logical_h() * s_set.window_scale,
-                             SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (s_hidden ? SDL_WINDOW_HIDDEN : 0));
+                             SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (s_hidden ? SDL_WINDOW_HIDDEN : 0)
+#ifdef __ANDROID__
+                             | SDL_WINDOW_FULLSCREEN_DESKTOP
+#endif
+                             );
+    cyc_touch_set_window(s_win);
     cyc_shader_request_renderer();
     s_ren = s_win ? SDL_CreateRenderer(s_win, -1, SDL_RENDERER_ACCELERATED) : NULL;
     SDL_ResetHint(SDL_HINT_RENDER_DRIVER);
@@ -1388,6 +1428,8 @@ int cyc_sdl_main(const char *title_in, int scale)
                 if (s_act_hold[p][b]) st.buttons[p] |= (uint8_t)(0x80 >> b);
         for (int i = 0; i < CYC_SC_COUNT; ++i)
             if (s_sc_hold[i]) st.shortcut[i] = true;
+        st.buttons[0] |= cyc_touch_buttons();                   /* on-screen controls (cyc_touch.h) */
+        if (cyc_touch_menu_held()) st.shortcut[CYC_SC_MENU] = true;
         bool edge[CYC_SC_COUNT];
         for (int i = 0; i < CYC_SC_COUNT; ++i) {
             edge[i] = st.shortcut[i] && !prev[i];
@@ -1512,6 +1554,20 @@ int cyc_sdl_main(const char *title_in, int scale)
         }
         loops++;
         tnow = SDL_GetPerformanceCounter();
+#ifdef __ANDROID__
+        {   /* logcat (tag SDL/APP): can this device keep 60 frames a second? */
+            static Uint64 mark, loop_start, worst;
+            static long marked;
+            if (loop_start && tnow - loop_start > worst) worst = tnow - loop_start;
+            loop_start = tnow;
+            if (!mark) mark = tnow;
+            if (tnow - mark >= 5 * freq) {
+                SDL_Log("speed: %.1f fps, slowest loop %.1f ms", (double)(s_frames_done - marked) * (double)freq / (double)(tnow - mark),
+                        1000.0 * (double)worst / (double)freq);
+                mark = tnow, marked = s_frames_done, worst = 0;
+            }
+        }
+#endif
 #ifdef CYC_DEV_UI
         if (tnow - fps_mark >= freq) {
             double secs = (double)(tnow - fps_mark) / (double)freq;

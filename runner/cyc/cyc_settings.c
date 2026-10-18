@@ -11,6 +11,9 @@
 #else
 #include <unistd.h>
 #endif
+#ifdef __ANDROID__
+#include <SDL_system.h>
+#endif
 
 void cyc_settings_default(CycSettings *s)
 {
@@ -33,7 +36,12 @@ const char *cyc_settings_default_path(void)
 {
     static char path[1024];
     char dir[900] = ".";
-#ifdef _WIN32
+#ifdef __ANDROID__
+    /* no writable directory beside the process: the app's internal storage */
+    const char *storage = SDL_AndroidGetInternalStoragePath();
+    snprintf(path, sizeof(path), "%s/config.ini", storage ? storage : ".");
+    return path;
+#elif defined(_WIN32)
     DWORD n = GetModuleFileNameA(NULL, dir, sizeof(dir));
     if (n == 0 || n >= sizeof(dir)) strcpy(dir, ".");
 #else

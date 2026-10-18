@@ -971,6 +971,22 @@ static bool s_saves_enabled = true;
 bool cyc_host_saves_enabled(void) { return s_saves_enabled; }
 #endif
 
+#ifdef __ANDROID__
+/* SDLActivity loads libmain.so and calls SDL_main on its own thread. The app's
+ * internal storage (where the Java side unpacked config, mods and assets, and
+ * copied the player's ROM) stands in for the executable's directory. */
+#include <SDL_system.h>
+#include <unistd.h>
+static int host_main(int argc, char **argv);
+__attribute__((visibility("default"))) int SDL_main(int argc, char **argv)
+{
+    const char *storage = SDL_AndroidGetInternalStoragePath();
+    if (storage) (void)chdir(storage);
+    return host_main(argc, argv);
+}
+#define main host_main
+#endif
+
 int main(int argc, char **argv) {
     const char *rom_path = NULL, *hash_out = NULL, *trace_out = NULL, *screenshot = NULL, *state_out = NULL,
                *wav_out = NULL, *mem_out = NULL;
