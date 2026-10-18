@@ -8,6 +8,8 @@
 // --channel  the Twitch channel to read (anonymous, read-only: no token)
 // --stdin    type chat yourself: "name: text" (as a viewer) or "text" (as the broadcaster)
 // --both     Twitch and stdin together
+// --mode     anarchy (commands run directly), vote (chat votes every round) or both;
+//            overrides the profile's vote.mode. Mods switch with !vote on|off|now
 // See README.md for the profile format.
 
 import fs from 'node:fs';
@@ -31,6 +33,7 @@ function args(argv) {
     else if (a === '--port') out.port = Number(val());
     else if (a === '--stdin') out.stdin = true;
     else if (a === '--both') out.both = true;
+    else if (a === '--mode') out.mode = val();
     else if (a === '--help' || a === '-h') out.help = true;
     else throw new Error(`unknown argument ${a}`);
   }
@@ -40,7 +43,7 @@ function args(argv) {
 function usage() {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const profiles = fs.readdirSync(path.join(here, 'profiles')).filter((f) => f.endsWith('.json'));
-  console.log(`usage: node twitch_bridge.mjs --profile FILE (--channel NAME | --stdin | --channel NAME --both) [--port 4370]
+  console.log(`usage: node twitch_bridge.mjs --profile FILE (--channel NAME | --stdin | --channel NAME --both) [--port 4370] [--mode anarchy|vote|both]
 profiles here: ${profiles.join(', ')}`);
 }
 
@@ -60,6 +63,7 @@ function main() {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const file = fs.existsSync(o.profile) ? o.profile : path.join(here, 'profiles', o.profile);
   const profile = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (o.mode) profile.vote = { ...profile.vote, mode: o.mode };
   const log = (s) => console.log(`[${new Date().toLocaleTimeString()}] ${s}`);
 
   let engine;
@@ -72,6 +76,10 @@ function main() {
   });
   engine = createEngine(profile, { game, log });
   log(`${engine.profile.name}: ${engine.profile.commands.size} commands; ${engine.helpLine()}`);
+  const v = engine.profile.vote;
+  log(`voting: ${v.mode}${v.mode === 'anarchy' ? ' (mods: !vote on)' : ''}, ${v.options} options, ` +
+      `${v.durationMs / 1000}s rounds every ${(v.durationMs + v.gapMs) / 1000}s`);
+  const stopVotes = engine.runVotes();
 
   const feed = (msg) => {
     if (!game.connected) return; // nothing to show it on
@@ -92,6 +100,7 @@ function main() {
     rl.on('close', () => { if (!irc) setTimeout(() => process.exit(0), 500); });
   }
   process.on('SIGINT', () => {
+    stopVotes();
     irc?.close();
     game.close();
     process.exit(0);

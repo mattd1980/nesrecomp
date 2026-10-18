@@ -7,6 +7,10 @@
  *
  *   chat        {user, text, color "RRGGBB", ms}   a line in the chat panel
  *   chat_banner {text, color, ms}                  a big line across the picture
+ *   chat_poll   {title, options "A|B", votes "3|1", ms, countdown, winner, y}
+ *               a poll panel centred at y percent of the height, up for
+ *               ms (counted down in its title unless countdown false), the
+ *               winner (0-based) lit; no options takes it down
  *   chat_pad    {buttons, mode, frames, label}     player 1's input, per frame:
  *               mode press (held), tap (pressed 8 frames, released 8),
  *               block (masked off), invert (Left/Right and/or Up/Down
@@ -20,7 +24,7 @@
  *               now, its RAM effects kept (cyc_mod_call_commit)
  *   chat_config {show, side left|right, valign top|bottom, offset (percent
  *               of the window height from that edge), lines, ms, scale}
- *   chat_clear  {}                                 messages, banner and every effect
+ *   chat_clear  {}                                 messages, banner, poll and every effect
  *   chat_state  {}                                 what is up and active
  *
  * A labelled effect is listed with its time left; a new effect with the same

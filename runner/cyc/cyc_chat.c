@@ -50,6 +50,13 @@ typedef struct {
 static Msg s_msg[MSG_MAX];
 static int s_msg_next, s_msg_count;  /* ring; the newest is at s_msg_next - 1 */
 static struct { char text[96]; uint32_t color, born, life; } s_banner;
+#define POLL_MAX 5
+static struct {
+    char     title[32], option[POLL_MAX][24];
+    int      votes[POLL_MAX], count, winner, y;
+    bool     countdown;
+    uint32_t born, life;
+} s_poll;
 static PadFx s_pad[PAD_MAX];
 static RamFx s_ram[RAM_MAX];
 /* offset: percent of the window height between the panel and its edge */
@@ -187,6 +194,42 @@ static void tcp_banner(int id, const char *line)
     cyc_tcp_ok(id, NULL);
 }
 
+/* `options` and `votes` are '|'-separated lists ("STAR|MOON", "3|1"); a
+ * request without options takes the poll down. */
+static void tcp_poll(int id, const char *line)
+{
+    char options[POLL_MAX * 24 + 8] = "", votes[POLL_MAX * 8 + 8] = "";
+    cyc_tcp_str(line, "options", options, sizeof(options));
+    cyc_tcp_str(line, "votes", votes, sizeof(votes));
+    s_poll.count = 0;
+    if (!options[0]) { cyc_tcp_ok(id, NULL); return; }
+    char *o = options, *v = votes;
+    while (o && s_poll.count < POLL_MAX) {
+        char *bar = strchr(o, '|');
+        if (bar) *bar = 0;
+        snprintf(s_poll.option[s_poll.count], sizeof(s_poll.option[0]), "%s", o);
+        printable(s_poll.option[s_poll.count]);
+        long n = v && *v ? strtol(v, &v, 10) : 0;
+        if (v && *v == '|') ++v;
+        s_poll.votes[s_poll.count++] = n < 0 ? 0 : n > 99999 ? 99999 : (int)n;
+        o = bar ? bar + 1 : NULL;
+    }
+    if (!cyc_tcp_str(line, "title", s_poll.title, sizeof(s_poll.title))) snprintf(s_poll.title, sizeof(s_poll.title), "VOTE");
+    printable(s_poll.title);
+    long ms = 10000, winner = -1, y = 20;
+    bool countdown = true;
+    cyc_tcp_long(line, "ms", &ms);
+    cyc_tcp_long(line, "winner", &winner);
+    cyc_tcp_long(line, "y", &y);
+    cyc_tcp_bool(line, "countdown", &countdown);
+    s_poll.winner = winner >= 0 && winner < s_poll.count ? (int)winner : -1;
+    s_poll.y = y < 0 ? 0 : y > 90 ? 90 : (int)y;
+    s_poll.countdown = countdown;
+    s_poll.born = SDL_GetTicks();
+    s_poll.life = (uint32_t)(ms < 500 ? 500 : ms > 600000 ? 600000 : ms);
+    cyc_tcp_ok(id, NULL);
+}
+
 static void tcp_pad(int id, const char *line)
 {
     char mode[16] = "press", label[40] = "";
@@ -310,6 +353,7 @@ static void tcp_clear(int id, const char *line)
     (void)line;
     s_msg_count = s_msg_next = 0;
     s_banner.life = 0;
+    s_poll.count = 0;
     memset(s_pad, 0, sizeof(s_pad));
     memset(s_ram, 0, sizeof(s_ram));
     cyc_tcp_ok(id, NULL);
@@ -335,6 +379,7 @@ void cyc_chat_register_tcp(void)
 {
     cyc_tcp_register("chat", "a chat line over the game: user, text, color (RRGGBB), ms", tcp_chat);
     cyc_tcp_register("chat_banner", "a big line across the picture: text, color, ms", tcp_banner);
+    cyc_tcp_register("chat_poll", "a poll over the game: title, options a|b|c, votes 1|0|2, ms, countdown, winner, y (%)", tcp_poll);
     cyc_tcp_register("chat_pad", "player 1 input effect: buttons, mode press|tap|block|invert, frames, label", tcp_pad);
     cyc_tcp_register("chat_ram", "RAM effect: addr, set|add|or|and, min, max, frames, every, if_addr, if_eq, label", tcp_ram);
     cyc_tcp_register("chat_call", "run a routine of the program now and keep its RAM effects: addr, a, x, y", tcp_call);
@@ -493,9 +538,43 @@ static void draw_banner(uint32_t now, int lw, int lh)
     text(x, y, zoom, s_banner.text, n, s_banner.color, a, true);
 }
 
+/* The poll: a title with its countdown, then one row per option with its
+ * number, a bar for its share of the votes and its count; the winner lit. */
+static void draw_poll(uint32_t now, int lw, int lh)
+{
+    unsigned a = s_poll.life ? fade(now, s_poll.born, s_poll.life) : 0;
+    if (!a || !s_poll.count) return;
+    const int cols = 30, w = cols * 8 + 8;
+    int total = 0, best = 0;
+    for (int i = 0; i < s_poll.count; ++i) {
+        total += s_poll.votes[i];
+        if (s_poll.votes[i] > best) best = s_poll.votes[i];
+    }
+    int x = (lw - w) / 2, y = lh * s_poll.y / 100;
+    box(x, y, w, (s_poll.count + 1) * (LINE_H + 2) + 6, 0x0C0C14, a * 190 / 255);
+    char row[64];
+    int n;
+    if (s_poll.countdown) {
+        uint32_t left = s_poll.life - (now - s_poll.born);
+        n = snprintf(row, sizeof(row), "%.22s %us", s_poll.title, (unsigned)((left + 999) / 1000));
+    } else {
+        n = snprintf(row, sizeof(row), "%.29s", s_poll.title);
+    }
+    text(x + 4, y + 3, 1, row, n < cols ? n : cols, 0xFFD25A, a, false);
+    for (int i = 0; i < s_poll.count; ++i) {
+        int ry = y + 3 + (i + 1) * (LINE_H + 2);
+        bool lit = s_poll.winner == i || (s_poll.winner < 0 && best && s_poll.votes[i] == best);
+        int bar = total ? s_poll.votes[i] * (w - 8) / total : 0;
+        box(x + 4, ry - 1, bar, LINE_H, s_poll.winner == i ? 0x3C8C3C : 0x2A3A6A, a * 220 / 255);
+        n = snprintf(row, sizeof(row), "%d %-20.20s %4d", i + 1, s_poll.option[i], s_poll.votes[i]);
+        text(x + 4, ry, 1, row, n < cols ? n : cols, lit ? 0xFFFFFF : 0xB4B4C8, a, false);
+    }
+}
+
 static bool anything(uint32_t now)
 {
     if (s_banner.life && now - s_banner.born < s_banner.life) return true;
+    if (s_poll.life && s_poll.count && now - s_poll.born < s_poll.life) return true;
     for (int i = 0; i < PAD_MAX; ++i)
         if (s_pad[i].on && s_pad[i].label[0]) return true;
     for (int i = 0; i < RAM_MAX; ++i)
@@ -535,6 +614,7 @@ void cyc_chat_draw(SDL_Renderer *ren)
     memset(s_px, 0, need * 4);
     if (s_cfg.show) draw_panel(now, lw, lh);
     draw_effects(lw);
+    draw_poll(now, lw, lh);
     draw_banner(now, lw, lh);
     SDL_UpdateTexture(s_tex, NULL, s_px, lw * 4);
 

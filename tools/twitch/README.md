@@ -80,6 +80,33 @@ other TCP script can drive the window.
 - `!commands` (or `!help`) shows the commands everyone can use in the chat
   panel.
 
+## Voting
+
+```jsonc
+"vote": { "mode": "both", "options": 3, "duration_ms": 20000, "gap_ms": 15000,
+          "y": 22, "title": "CHAT VOTE", "pool": ["star", "moon", "invert"], "show_votes": false }
+```
+
+A round puts `options` commands from `pool` on a ballot. The default pool is
+every command that everyone can use and that needs no bits. The game shows
+the ballot as a poll panel `y` percent of the way down the screen, with live
+bars and a countdown. Viewers vote with `1`, `2`, `3`, with `!vote 2`, or
+with the command itself (`!star`). Each viewer has one vote, and their latest
+vote counts.
+
+When the round ends, the option with the most votes runs, ignoring its
+cooldown. Ties are broken at random. If the winner can't run right now (its
+`when` doesn't hold), the next option in line runs instead. A new round
+starts every `duration_ms + gap_ms`. Counted votes don't show up as chat
+lines unless `show_votes` is set.
+
+- `mode`: `anarchy` means only direct commands. `vote` means only votes for
+  viewers; the broadcaster, moderators, bits and rewards still run commands
+  directly. `both` runs votes and direct commands together. The bridge's
+  `--mode` flag overrides it.
+- The broadcaster and moderators can type `!vote off`, `!vote on` or
+  `!vote now` (same as `on`).
+
 `smb1.json` and `mm3.json` were checked against the real games:
 `prove-it/twitch/smb-live.mjs` and `mm3-live.mjs` in the nes-decomp
 workspace. Tests: `node --test tools/twitch/twitch.test.mjs`.

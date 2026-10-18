@@ -124,13 +124,31 @@ export function compileProfile(profile) {
       bits: c.bits ?? 0,
       cooldownMs: c.cooldown_ms ?? profile.command_cooldown_ms ?? 10000,
       variants,
+      title: printable(c.title ?? name.toUpperCase(), 20),
+      votable: c.vote ?? ((c.who ?? 'everyone') === 'everyone' && !c.bits),
       lastUsed: -Infinity,
     });
   }
   const aliases = new Map(Object.entries(profile.aliases ?? {}).map(([a, n]) => [a.toLowerCase(), n.toLowerCase()]));
   for (const [a, n] of aliases) if (!commands.has(n)) throw new Error(`alias !${a}: no command !${n}`);
   const rewards = new Map(Object.entries(profile.rewards ?? {}).map(([id, n]) => [id, n.toLowerCase()]));
+  const v = profile.vote ?? {};
+  const mode = v.mode ?? 'anarchy';
+  if (!['anarchy', 'vote', 'both'].includes(mode)) throw new Error(`vote.mode ${mode}: anarchy, vote or both`);
+  const pool = (v.pool ?? [...commands.values()].filter((c) => c.votable).map((c) => c.name)).map((n) => n.toLowerCase());
+  for (const n of pool) if (!commands.has(n)) throw new Error(`vote.pool: no command !${n}`);
+  const vote = {
+    mode,
+    pool,
+    options: Math.max(2, Math.min(5, v.options ?? 3)),
+    durationMs: v.duration_ms ?? 20000,
+    gapMs: v.gap_ms ?? 15000,
+    title: printable(v.title ?? 'CHAT VOTE', 22),
+    y: v.y ?? 20,
+    showVotes: v.show_votes ?? false,
+  };
   return {
+    vote,
     name: profile.name ?? 'game',
     prefix: profile.prefix ?? '!',
     chat: profile.chat ?? {},
@@ -164,7 +182,7 @@ function fill(template, msg, cmd) {
 }
 
 // The engine. game.send(cmd, fields) talks to the window; now() is a clock in ms.
-export function createEngine(profile, { game, now = () => Date.now(), log = () => {}, sleep } = {}) {
+export function createEngine(profile, { game, now = () => Date.now(), log = () => {}, sleep, random = Math.random } = {}) {
   const p = compileProfile(profile);
   const wait = sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const users = new Map();
@@ -185,12 +203,15 @@ export function createEngine(profile, { game, now = () => Date.now(), log = () =
     return null;
   }
 
-  async function run(cmd, msg) {
+  // force: chat's vote chose it - no permission or cooldown check, and the
+  // vote's own pseudo-user gets no user cooldown.
+  async function run(cmd, msg, { force = false } = {}) {
     const t = now();
-    if (!allowed(cmd, msg)) return { ran: false, why: 'not allowed' };
-    if (cmd.bits && msg.bits < cmd.bits && !msg.reward) return { ran: false, why: `needs ${cmd.bits} bits` };
+    if (!force && !allowed(cmd, msg)) return { ran: false, why: 'not allowed' };
+    if (!force && cmd.bits && msg.bits < cmd.bits && !msg.reward) return { ran: false, why: `needs ${cmd.bits} bits` };
     const privileged = msg.broadcaster || msg.mod;
-    if (!privileged && !msg.reward && !msg.bits) {
+    if (!force && !privileged && !msg.reward && !msg.bits) {
+      if (p.vote.mode === 'vote') return { ran: false, why: 'vote mode: commands win by vote' };
       if (t - lastEffect < p.globalCooldownMs) return { ran: false, why: 'global cooldown' };
       const u = users.get(msg.login) ?? -Infinity;
       if (t - u < p.userCooldownMs) return { ran: false, why: `user cooldown ${Math.ceil((p.userCooldownMs - (t - u)) / 1000)}s` };
@@ -199,7 +220,7 @@ export function createEngine(profile, { game, now = () => Date.now(), log = () =
     const v = await variantFor(cmd);
     if (!v) return { ran: false, why: 'not now (game state)' };
     lastEffect = cmd.lastUsed = t;
-    users.set(msg.login, t);
+    if (!force) users.set(msg.login, t);
     // steps between waits go as one batch: one gap between frames, so a state
     // change made of several stores is never seen half done
     let batch = [];
@@ -231,16 +252,112 @@ export function createEngine(profile, { game, now = () => Date.now(), log = () =
     return 'COMMANDS: ' + [...p.commands.values()].filter((c) => c.who === 'everyone').map((c) => p.prefix + c.name).join(' ');
   }
 
+  // ---- voting: a round offers a few commands, chat answers 1..N (or the
+  // command, or !vote N), one vote per viewer (the last one counts), and the
+  // winner runs as if the broadcaster had typed it ----
+  const round = { open: false, options: [], votes: new Map(), endsAt: 0, lastShown: 0 };
+  let voteOn = p.vote.mode !== 'anarchy';
+
+  const tally = () => round.options.map((_, i) => [...round.votes.values()].filter((v) => v === i).length);
+
+  async function showPoll(extra = {}) {
+    round.lastShown = now();
+    await game.send('chat_poll', {
+      title: p.vote.title,
+      options: round.options.map((c) => c.title).join('|'),
+      votes: tally().join('|'),
+      ms: Math.max(500, round.endsAt - now()),
+      y: p.vote.y,
+      ...extra,
+    });
+  }
+
+  // Start a round: options drawn at random from the pool.
+  function startVote() {
+    const job = queue.then(async () => {
+      const pool = p.vote.pool.map((n) => p.commands.get(n));
+      const options = [];
+      const count = Math.min(p.vote.options, pool.length);
+      while (options.length < count) options.push(pool.splice(Math.floor(random() * pool.length), 1)[0]);
+      Object.assign(round, { open: true, options, votes: new Map(), endsAt: now() + p.vote.durationMs });
+      log(`vote: ${options.map((c, i) => `${i + 1}=${c.name}`).join(' ')}`);
+      await showPoll();
+      return options.map((c) => c.name);
+    });
+    queue = job.catch(() => {});
+    return job;
+  }
+
+  // Close the round: the most voted option that can run now runs (ties at random).
+  function finishVote() {
+    const job = queue.then(async () => {
+      if (!round.open) return null;
+      round.open = false;
+      const counts = tally();
+      const order = round.options.map((c, i) => ({ c, i, n: counts[i], r: random() }))
+        .filter((o) => o.n > 0)
+        .sort((a, b) => b.n - a.n || a.r - b.r);
+      const chat = { user: 'CHAT', login: '', broadcaster: false, mod: false, bits: 0 };
+      for (const o of order) {
+        const r = await run(o.c, chat, { force: true });
+        log(`vote: ${o.c.name} (${o.n} votes): ${r.ran ? 'ran' : r.why}`);
+        if (!r.ran) continue;
+        round.endsAt = now() + 4000;
+        await showPoll({ winner: o.i, countdown: false, title: 'CHAT CHOSE' });
+        await game.send('chat_banner', { text: `CHAT CHOSE ${o.c.title}!`, color: '7CFF7C', ms: 2500 });
+        return { winner: o.c.name, votes: counts };
+      }
+      round.endsAt = now() + 3000;
+      await showPoll({ countdown: false, title: order.length ? 'NOTHING COULD RUN' : 'NO VOTES' });
+      return { winner: null, votes: counts };
+    });
+    queue = job.catch(() => {});
+    return job;
+  }
+
+  // A vote, if this message is one; true when it was counted.
+  function castVote(msg, text, hit) {
+    if (!round.open || !msg.login) return false;
+    let i = -1;
+    const n = /^(?:!vote\s+)?#?([1-9])$/i.exec(text.trim());
+    if (n) i = Number(n[1]) - 1;
+    else if (hit?.cmd) i = round.options.indexOf(hit.cmd);
+    if (i < 0 || i >= round.options.length) return false;
+    round.votes.set(msg.login, i);
+    return true;
+  }
+
+  // !vote on|off|now, for the broadcaster and moderators.
+  function voteControl(msg, text) {
+    const m = /^!vote\s+(on|off|now)$/i.exec(text.trim());
+    if (!m || !(msg.broadcaster || msg.mod)) return null;
+    voteOn = m[1].toLowerCase() !== 'off';
+    if (m[1].toLowerCase() === 'off') round.open = false;
+    return m[1].toLowerCase();
+  }
+
   // One chat message: shown, then (serialised with the others) acted on.
   function handle(msg) {
     const text = printable(msg.text);
     const rewardCmd = msg.rewardId ? p.rewards.get(msg.rewardId) : undefined;
     if (msg.rewardId && !rewardCmd) log(`unmapped channel-point reward id ${msg.rewardId} (add it to "rewards")`);
     const job = queue.then(async () => {
-      if (text) {
+      const hit = rewardCmd ? { word: rewardCmd, cmd: p.commands.get(rewardCmd) } : lookup(text);
+      // a counted vote shows in the poll, not as a chat line (unless vote.show_votes)
+      const voted = !rewardCmd && !msg.bits && castVote(msg, text, hit);
+      if (text && (!voted || p.vote.showVotes)) {
         await game.send('chat', { user: printable(msg.user, 24), color: nameColor(msg), text }).catch((e) => log(`chat: ${e.message}`));
       }
-      const hit = rewardCmd ? { word: rewardCmd, cmd: p.commands.get(rewardCmd) } : lookup(text);
+      if (voted) {
+        if (now() - round.lastShown > 300) await showPoll().catch(() => {});
+        return { voted: true };
+      }
+      const control = voteControl(msg, text);
+      if (control) {
+        log(`${msg.user}: vote ${control}`);
+        if (control === 'off') await game.send('chat_poll', {}).catch(() => {});
+        return { vote: control };
+      }
       if (!hit) return null;
       if (hit.word === 'commands' || hit.word === 'help') {
         if (!hit.cmd) await game.send('chat', { user: '', color: 'FFD25A', text: helpLine() }).catch(() => {});
@@ -267,5 +384,30 @@ export function createEngine(profile, { game, now = () => Date.now(), log = () =
     if (Object.keys(fields).length) await game.send('chat_config', fields);
   }
 
-  return { handle, configure, helpLine, profile: p };
+  // The vote loop the bridge runs: a round every duration + gap while voting is on.
+  function runVotes() {
+    let timer = null;
+    const next = (ms) => { timer = setTimeout(step, ms); };
+    const step = async () => {
+      try {
+        if (!voteOn || !game.connected) return next(2000);
+        if (!round.open) {
+          await startVote();
+          return next(p.vote.durationMs);
+        }
+        await finishVote();
+        next(p.vote.gapMs);
+      } catch (e) {
+        log(`vote: ${e.message}`);
+        next(5000);
+      }
+    };
+    next(p.vote.gapMs);
+    return () => clearTimeout(timer);
+  }
+
+  return {
+    handle, configure, helpLine, profile: p, startVote, finishVote, runVotes,
+    get voting() { return voteOn; },
+  };
 }
