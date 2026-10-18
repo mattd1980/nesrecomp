@@ -41,9 +41,16 @@ export function printable(s, max = 200) {
   return ascii.length > max ? ascii.slice(0, max - 3) + '...' : ascii;
 }
 
+// The viewer's Twitch colour, lifted toward white when too dark to read on
+// the panel's dark rows; a stable pick from a palette when they have none.
 export function nameColor(msg) {
   const c = /^#?([0-9a-f]{6})$/i.exec(msg.color ?? '');
-  if (c) return c[1].toUpperCase();
+  if (c) {
+    let [r, g, b] = [0, 2, 4].map((i) => parseInt(c[1].slice(i, i + 2), 16));
+    const luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+    if (luma < 0.45) [r, g, b] = [r, g, b].map((v) => Math.round(v + (255 - v) * 0.45));
+    return [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+  }
   let h = 0;
   for (const ch of msg.login ?? msg.user) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
   return NAME_COLORS[h % NAME_COLORS.length];
