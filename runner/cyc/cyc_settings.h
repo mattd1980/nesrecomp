@@ -4,7 +4,7 @@
  *
  * The keys nesrecomp's other runtime and recomp-ui's NES launcher already use
  * keep their names ([Display] WindowScale, Fullscreen, IntegerScale,
- * LinearFilter; [Audio] Volume; [Input] PlayerNSource / PlayerNDevice /
+ * LinearFilter, Shader; [Audio] Volume; [Input] PlayerNSource / PlayerNDevice /
  * PlayerNDeadzone; [Launcher] SkipLauncher). The cycle host adds:
  *
  *   [Audio]    Enabled
@@ -44,6 +44,7 @@ typedef struct CycSettings {
     unsigned zapper_keys;   /* presence bits for migration from legacy keybinds.ini */
     int hdpack_enabled;
     char hdpack_dir[512];   /* existing [Display] HD pack settings */
+    char shader_path[512];  /* [Display] Shader: a .glsl / .glslp (cyc_shader.h); "" none */
     NesFdsHleAsk fds_hle;   /* the player's saved HLE choices (the plan's "settings" source) */
     char fds_bios[512];     /* [FDS] Bios: the player's FDS BIOS file; "" looks for one */
     CycBindings  bind;

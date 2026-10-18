@@ -37,6 +37,9 @@
  * (cyc_render.h): the machine's 256x240 frame, or a game compositor's at the
  * width cyc_video.h settles on. A width change (a new mode, or Fit following a
  * window resize) is applied after the present and before the next picture.
+ * The window takes the OpenGL renderer so a [Display] Shader (the launcher's
+ * pick, or the menu's Graphics > Shader, live) can run: the picture alone
+ * goes through that GLSL pass (cyc_shader.h).
  *
  * Save states (cyc_state.h): the Save state / Load state shortcuts (F8 / F9)
  * and the menu's rows use one slot, <exe dir>/saves/<image stem>.cycstate
@@ -63,6 +66,7 @@
 #include "cyc_run.h"
 #include "cyc_session.h"
 #include "cyc_settings.h"
+#include "cyc_shader.h"
 #ifdef NESRECOMP_CYCLE_HDPACK
 #include "cyc_hdpack.h"
 #endif
@@ -245,6 +249,7 @@ bool cyc_sdl_error_box(const char *title, const char *text)
 static SDL_Window   *s_win;
 static SDL_Renderer *s_ren;
 static SDL_Texture  *s_tex;
+static CycShader    *s_shader;       /* [Display] Shader; NULL draws the picture plain */
 static int           s_tex_w, s_tex_h;
 static bool          s_bar;          /* dev builds: the drive bar */
 static long          s_frames_done;
@@ -350,9 +355,29 @@ static void apply_picture_scale(void)
         SDL_RenderSetIntegerScale(s_ren, integer);
 }
 
+/* Follows [Display] Shader: the launcher's pick at start, the menu's live. */
+static void apply_shader(void)
+{
+    static char loaded[sizeof(s_set.shader_path)];
+    static bool tried;
+    if (tried && !strcmp(loaded, s_set.shader_path)) return;
+    tried = true;
+    snprintf(loaded, sizeof(loaded), "%s", s_set.shader_path);
+    cyc_shader_free(s_shader, s_ren, s_tex);
+    s_shader = NULL;
+    if (!s_set.shader_path[0]) return;
+    char err[600];
+    s_shader = cyc_shader_load(s_ren, s_set.shader_path, err, sizeof(err));
+    if (!s_shader) {
+        fprintf(stderr, "shader off: %s\n", err);
+        note("SHADER OFF", "see the log");
+    }
+}
+
 static void apply_settings(void)
 {
     if (!s_win) return;
+    apply_shader();
     Uint32 fs = s_set.fullscreen == 1 ? SDL_WINDOW_FULLSCREEN_DESKTOP : s_set.fullscreen == 2 ? SDL_WINDOW_FULLSCREEN : 0;
     if ((SDL_GetWindowFlags(s_win) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != fs)
         SDL_SetWindowFullscreen(s_win, fs);
@@ -1073,7 +1098,15 @@ static void show(bool loading, const char *toast_title, const char *toast_body)
     SDL_SetRenderDrawColor(s_ren, 0, 0, 0, 255);
     SDL_RenderClear(s_ren);
     SDL_Rect dst = { 0, 0, w, h };
-    SDL_RenderCopy(s_ren, s_tex, NULL, &dst);
+    if (!cyc_shader_draw(s_shader, s_ren, s_tex, w, h, s_frames_done)) {
+        if (cyc_shader_error(s_shader)) {
+            fprintf(stderr, "shader off: %s\n", cyc_shader_error(s_shader));
+            note("SHADER OFF", "see the log");
+            cyc_shader_free(s_shader, s_ren, s_tex);
+            s_shader = NULL;
+        }
+        SDL_RenderCopy(s_ren, s_tex, NULL, &dst);
+    }
     CycZapperState gun;
     cyc_zapper_state(&gun);
     if (gun.port && s_set.zapper_crosshair && gun.x >= 0 && !menu_open()) {
@@ -1202,7 +1235,9 @@ int cyc_sdl_main(const char *title_in, int scale)
     s_win = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w * s_set.window_scale,
                              logical_h() * s_set.window_scale,
                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (s_hidden ? SDL_WINDOW_HIDDEN : 0));
+    cyc_shader_request_renderer();
     s_ren = s_win ? SDL_CreateRenderer(s_win, -1, SDL_RENDERER_ACCELERATED) : NULL;
+    SDL_ResetHint(SDL_HINT_RENDER_DRIVER);
     /* offscreen / headless video drivers have no accelerated renderer */
     if (s_win && !s_ren) s_ren = SDL_CreateRenderer(s_win, -1, SDL_RENDERER_SOFTWARE);
     if (!s_ren || !ensure_texture(w, h)) {
@@ -1478,6 +1513,8 @@ int cyc_sdl_main(const char *title_in, int scale)
     if (dev) SDL_CloseAudioDevice(dev);
     for (int i = 0; i < s_pad_count; ++i) SDL_GameControllerClose(s_pads[i]);
     if (s_vpad_joy) SDL_JoystickClose(s_vpad_joy);
+    cyc_shader_free(s_shader, s_ren, s_tex);
+    s_shader = NULL;
     SDL_DestroyTexture(s_tex);
     SDL_DestroyRenderer(s_ren);
     SDL_DestroyWindow(s_win);

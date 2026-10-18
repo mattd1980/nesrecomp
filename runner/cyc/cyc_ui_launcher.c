@@ -62,6 +62,7 @@ static void to_launcher(const CycSettings *s, RecompLauncherCSettings *io, const
     snprintf(io->netplay_player_name,sizeof io->netplay_player_name,"%s",s->netplay_player_name);
     io->hdpack_enabled = s->hdpack_enabled;
     snprintf(io->hdpack_dir,sizeof io->hdpack_dir,"%s",s->hdpack_dir);
+    snprintf(io->shader_path, sizeof(io->shader_path), "%s", s->shader_path);
 #ifdef RECOMP_LAUNCHER_HAS_ZAPPER_SETTINGS
     io->zapper_mouse = s->zapper_mouse ? 1 : -1;
     io->zapper_crosshair = s->zapper_crosshair ? 1 : -1;
@@ -96,6 +97,7 @@ static void from_launcher(const RecompLauncherCSettings *io, CycSettings *s, con
     snprintf(s->netplay_player_name,sizeof s->netplay_player_name,"%s",io->netplay_player_name);
     s->hdpack_enabled = io->hdpack_enabled != 0;
     snprintf(s->hdpack_dir,sizeof s->hdpack_dir,"%s",io->hdpack_dir);
+    snprintf(s->shader_path, sizeof(s->shader_path), "%s", io->shader_path);
 #ifdef RECOMP_LAUNCHER_HAS_ZAPPER_SETTINGS
     s->zapper_mouse = io->zapper_mouse >= 0;
     s->zapper_crosshair = io->zapper_crosshair >= 0;
@@ -214,6 +216,7 @@ int cyc_ui_launcher(CycSettings *settings, const char *settings_path, const CycH
     gi.hdpack_supported = 0;
 #endif
     gi.has_integer_scale = 1;
+    gi.has_shader = 1;                /* [Display] Shader, applied by cyc_shader.c */
     /* a game's view modes are a runtime-menu row (live), not a launcher toggle */
     gi.widescreen_supported = 0;
     (void)extras;

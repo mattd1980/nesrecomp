@@ -125,6 +125,7 @@ bool cyc_settings_load(CycSettings *s, const char *path, FILE *log, const CycSet
             else if (eq_ci(key, "LinearFilter")) bad = !parse_int(val, &v) || (s->linear_filter = v != 0, 0);
             else if (eq_ci(key, "HdPackEnabled")) bad = !parse_int(val, &v) || (s->hdpack_enabled = v != 0, 0);
             else if (eq_ci(key, "HdPackDir")) snprintf(s->hdpack_dir,sizeof s->hdpack_dir,"%s",val);
+            else if (eq_ci(key, "Shader")) snprintf(s->shader_path, sizeof(s->shader_path), "%s", val);
             break;
         case SEC_AUDIO:
             if (eq_ci(key, "Volume")) bad = !parse_int(val, &v) || (s->volume = clampi(v, 0, 100), 0);
@@ -208,6 +209,8 @@ bool cyc_settings_save(const CycSettings *s, const char *path, const CycSettings
     fprintf(f, "[Display]\nWindowScale = %d\nFullscreen = %d\nIntegerScale = %d\nLinearFilter = %d\n",
             s->window_scale, s->fullscreen, s->integer_scale, s->linear_filter);
     fprintf(f,"HdPackEnabled = %d\nHdPackDir = %s\n",s->hdpack_enabled,s->hdpack_dir);
+    fprintf(f, "# a GLSL shader (.glsl or one-pass .glslp) for the picture; empty: none\n"
+               "Shader = %s\n", s->shader_path);
     fprintf(f, "[Audio]\nEnabled = %d\nVolume = %d\n", s->audio_enabled, s->volume);
     fprintf(f, "[Input]\n");
     for (int p = 0; p < CYC_INPUT_PLAYERS; ++p)

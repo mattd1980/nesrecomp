@@ -102,7 +102,8 @@ endfunction()
 set(NESRECOMP_CYC_HELPER_TEST_SOURCES ${NESRECOMP_CYC_DIR}/cyc_helper_test.c)
 
 # Adds the SDL2 window and audio (cyc_sdl.c), its input actions and bindings
-# (cyc_input.c), settings (cyc_settings.c, config.ini) and TCP debug server
+# (cyc_input.c), settings (cyc_settings.c, config.ini), the optional GLSL pass
+# (cyc_shader.c, shaders/ staged as assets/shaders) and TCP debug server
 # (cyc_tcp.c) to a host executable if SDL2 is found. Without it the executable
 # is headless only. DEV_UI / NO_DEV_UI override NESRECOMP_DEV_UI for this target. A game's own
 # host extras (cyc_host_extras.h) replace the default cyc_host_extras_none.c
@@ -116,7 +117,11 @@ function(nesrecomp_cyc_enable_sdl target)
         return()
     endif()
     target_sources(${target} PRIVATE ${NESRECOMP_CYC_DIR}/cyc_sdl.c ${NESRECOMP_CYC_DIR}/cyc_input.c
-        ${NESRECOMP_CYC_DIR}/cyc_settings.c ${NESRECOMP_CYC_DIR}/cyc_tcp.c)
+        ${NESRECOMP_CYC_DIR}/cyc_settings.c ${NESRECOMP_CYC_DIR}/cyc_tcp.c ${NESRECOMP_CYC_DIR}/cyc_shader.c)
+    # The bundled GLSL shaders (cyc_shader.h), where the launcher lists presets.
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${NESRECOMP_CYC_DIR}/shaders
+                $<TARGET_FILE_DIR:${target}>/assets/shaders)
     if(WIN32)
         target_link_libraries(${target} PRIVATE ws2_32)
     endif()

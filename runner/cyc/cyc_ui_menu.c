@@ -12,6 +12,7 @@
 #include "cyc_disk_action.h"
 #include "cyc_host.h"
 #include "cyc_run.h"
+#include "cyc_shader.h"
 #include "recomp_runtime_ui.h"
 #include "recomp_launcher.h"
 #ifdef NESRECOMP_NET
@@ -44,6 +45,16 @@ static char s_shortcut_label[CYC_SC_COUNT][96];
 static char s_axis_key[MAX_AXES][24];
 static char s_shortcut_key[CYC_SC_COUNT][24];
 static uint64_t s_quit_armed;
+
+/* Graphics > Shader: None, the bundled shaders, then the setting itself when
+ * it names another file (the launcher's Browse...). Changes apply live. */
+#define MAX_SHADERS 32
+static CycShaderEntry s_shaders[MAX_SHADERS];
+static int s_shader_count;                    /* bundled entries */
+static const char *s_shader_choices[MAX_SHADERS + 2];
+static char s_shader_custom[512];             /* the outside file, "" when none */
+
+static void add_shader_row(void);
 
 /* ---- Mods: every feature of the mod runtime's catalog (cyc_session.h), with
  * its options, edited live. A change goes to the runtime (the same calls the
@@ -293,6 +304,40 @@ static void refresh(void)
     }
 }
 
+static void add_shader_row(void)
+{
+    const char *current = s_host.settings->shader_path;
+    s_shader_count = cyc_shader_list(s_shaders, MAX_SHADERS);
+    int n = 0;
+    s_shader_choices[n++] = "None";
+    bool listed = !current[0];
+    for (int i = 0; i < s_shader_count; ++i) {
+        s_shader_choices[n++] = s_shaders[i].label;
+        if (cyc_shader_same(current, s_shaders[i].path)) listed = true;
+    }
+    snprintf(s_shader_custom, sizeof(s_shader_custom), "%s", listed ? "" : current);
+    if (s_shader_custom[0]) s_shader_choices[n++] = "Custom (launcher)";
+    add("cyc.shader", "Graphics", "Shader",
+        "Picture filter from assets/shaders.",
+        RECOMP_RUNTIME_UI_CHOICE, 0, n - 1, 1, s_shader_choices, (size_t)n, NULL);
+}
+
+static int shader_index(void)
+{
+    const char *current = s_host.settings->shader_path;
+    if (!current[0]) return 0;
+    for (int i = 0; i < s_shader_count; ++i)
+        if (cyc_shader_same(current, s_shaders[i].path)) return i + 1;
+    return s_shader_custom[0] ? s_shader_count + 1 : 0;
+}
+
+static void set_shader_index(int v)
+{
+    CycSettings *s = s_host.settings;
+    const char *path = v <= 0 ? "" : v <= s_shader_count ? s_shaders[v - 1].path : s_shader_custom;
+    snprintf(s->shader_path, sizeof(s->shader_path), "%s", path);
+}
+
 static int get_value(void *ctx, const RecompRuntimeUiItem *it, int *out)
 {
     (void)ctx;
@@ -302,6 +347,7 @@ static int get_value(void *ctx, const RecompRuntimeUiItem *it, int *out)
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_WINDOW_SCALE)) *out = s->window_scale;
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE)) *out = s->integer_scale;
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER)) *out = s->linear_filter;
+    else if (is_key(it, "cyc.shader")) *out = shader_index();
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_AUDIO)) *out = s->audio_enabled;
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_VOLUME)) *out = s->volume;
     else if (is_key(it, "cyc.zapper.mouse")) *out = s->zapper_mouse;
@@ -331,6 +377,7 @@ static int set_value(void *ctx, const RecompRuntimeUiItem *it, int v)
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_WINDOW_SCALE)) s->window_scale = v < 1 ? 1 : v > 8 ? 8 : v;
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE)) s->integer_scale = v != 0;
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER)) s->linear_filter = v != 0;
+    else if (is_key(it, "cyc.shader")) set_shader_index(v);
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_AUDIO)) s->audio_enabled = v != 0;
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_VOLUME)) s->volume = v < 0 ? 0 : v > 100 ? 100 : v;
     else if (is_key(it, "cyc.zapper.mouse")) s->zapper_mouse = v != 0;
@@ -451,6 +498,7 @@ RecompRuntimeUi *cyc_ui_menu_create(const CycUiHost *host)
     s_host = *host;
     s_item_count = 0;
     const CycHostExtras *x = host->extras;
+    add_shader_row();
     if (host->fds) {
         unsigned sides = cyc_fds_side_count();
         if (sides > MAX_SIDES) sides = MAX_SIDES;
