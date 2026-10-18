@@ -50,6 +50,8 @@ set(NESRECOMP_CYC_SOURCES
     ${NESRECOMP_CYC_DIR}/cyc_state.c
     ${NESRECOMP_CYC_DIR}/cyc_video.c
     ${NESRECOMP_CYC_DIR}/cyc_render.c
+    # Presentation effects a game draws over its picture (cyc_fx.h).
+    ${NESRECOMP_CYC_DIR}/cyc_fx.c
     # The trusted-plugin registries (runner/include/mod_function_hooks.h,
     # mod_savestate.h): dependency-free C, linked whether or not a game has mods.
     ${NESRECOMP_CYC_DIR}/../src/mod_function_hooks.c
