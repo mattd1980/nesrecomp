@@ -55,6 +55,133 @@ static const char *s_shader_choices[MAX_SHADERS + 2];
 static char s_shader_custom[512];             /* the outside file, "" when none */
 
 static void add_shader_row(void);
+static void add(const char *key, const char *section, const char *label, const char *desc,
+                RecompRuntimeUiItemType type, int min, int max, int step, const char *const *choices,
+                size_t choice_count, const int *values);
+
+/* Player N controls: the input source, each NES button's controller binding
+ * (select the row, then press a controller button or pull a trigger), the
+ * stick deadzone and a reset. Edits apply at once and are saved to config.ini,
+ * the file the launcher's Controls page edits too. */
+#define PAD_PLAYERS (CYC_INPUT_PLAYERS < 2 ? CYC_INPUT_PLAYERS : 2)
+static const char *const NES_BUTTON[CYC_INPUT_BUTTONS] = { "A", "B", "Select", "Start", "Up", "Down", "Left", "Right" };
+static const char *const SOURCE_P1[] = { "None", "Keyboard + first controller", "Controller only" };
+static const char *const SOURCE_PN[] = { "None", "Keyboard", "Controller" };
+static char s_pad_section[PAD_PLAYERS][24];
+static char s_pad_key[PAD_PLAYERS][CYC_INPUT_BUTTONS][24], s_pad_label[PAD_PLAYERS][CYC_INPUT_BUTTONS][64];
+static char s_src_key[PAD_PLAYERS][24], s_dz_key[PAD_PLAYERS][24], s_reset_key[PAD_PLAYERS][24];
+static int s_capture_p = -1, s_capture_b = -1;
+static char s_status[128];
+
+/* "x" -> "X", "back" -> "View", "lefttrigger+" -> "LT": an Xbox controller's names */
+static void pad_name(int binding, char *out, size_t n)
+{
+    static const struct { const char *sdl, *shown; } NAMES[] = {
+        { "a", "A" }, { "b", "B" }, { "x", "X" }, { "y", "Y" }, { "back", "View" }, { "start", "Menu" },
+        { "guide", "Xbox" }, { "leftshoulder", "LB" }, { "rightshoulder", "RB" }, { "leftstick", "LS" },
+        { "rightstick", "RS" }, { "dpup", "D-pad Up" }, { "dpdown", "D-pad Down" }, { "dpleft", "D-pad Left" },
+        { "dpright", "D-pad Right" }, { "lefttrigger+", "LT" }, { "righttrigger+", "RT" },
+    };
+    char raw[96];
+    cyc_pad_text(binding, raw, sizeof(raw));
+    if (!binding || !raw[0] || !strcmp(raw, "none")) { snprintf(out, n, "unbound"); return; }
+    out[0] = 0;
+    for (char *part = strtok(raw, "+"); part; part = strtok(NULL, "+")) {
+        const char *shown = part;
+        char trig[32];
+        snprintf(trig, sizeof(trig), "%s+", part);            /* "lefttrigger" lost its "+" to strtok */
+        for (size_t i = 0; i < sizeof(NAMES) / sizeof(NAMES[0]); ++i)
+            if (!strcmp(NAMES[i].sdl, part) || !strcmp(NAMES[i].sdl, trig)) { shown = NAMES[i].shown; break; }
+        size_t len = strlen(out);
+        snprintf(out + len, n - len, "%s%s", len ? " + " : "", shown);
+    }
+}
+
+static int pad_row(const RecompRuntimeUiItem *it, int *player, int *button)
+{
+    for (int p = 0; p < PAD_PLAYERS; ++p)
+        for (int b = 0; b < CYC_INPUT_BUTTONS; ++b)
+            if (it->key == s_pad_key[p][b]) { *player = p; *button = b; return 1; }
+    return 0;
+}
+
+static int key_player(const RecompRuntimeUiItem *it, char keys[][24])
+{
+    for (int p = 0; p < PAD_PLAYERS; ++p) if (it->key == keys[p]) return p;
+    return -1;
+}
+
+static void pad_labels(void)
+{
+    for (int p = 0; p < PAD_PLAYERS; ++p)
+        for (int b = 0; b < CYC_INPUT_BUTTONS; ++b) {
+            char name[64];
+            if (p == s_capture_p && b == s_capture_b) snprintf(name, sizeof(name), "press a controller button...");
+            else pad_name(s_host.settings->bind.button[p][b].pad, name, sizeof(name));
+            snprintf(s_pad_label[p][b], sizeof(s_pad_label[p][b]), "%s: %s", NES_BUTTON[b], name);
+        }
+}
+
+static void add_pad_rows(void)
+{
+    for (int p = 0; p < PAD_PLAYERS; ++p) {
+        snprintf(s_pad_section[p], sizeof(s_pad_section[p]), "Player %d", p + 1);
+        snprintf(s_src_key[p], sizeof(s_src_key[p]), "cyc.input.%d.source", p);
+        add(s_src_key[p], s_pad_section[p], "Input",
+            p == 0 ? "Keyboard also uses the first free controller." : "Which device this player reads.",
+            RECOMP_RUNTIME_UI_CHOICE, 0, 2, 1, p == 0 ? SOURCE_P1 : SOURCE_PN, 3, NULL);
+        for (int b = 0; b < CYC_INPUT_BUTTONS; ++b) {
+            snprintf(s_pad_key[p][b], sizeof(s_pad_key[p][b]), "cyc.input.%d.pad.%d", p, b);
+            add(s_pad_key[p][b], s_pad_section[p], s_pad_label[p][b],
+                "Select, then press the new button or trigger.",
+                RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, NULL, 0, NULL);
+        }
+        snprintf(s_dz_key[p], sizeof(s_dz_key[p]), "cyc.input.%d.deadzone", p);
+        add(s_dz_key[p], s_pad_section[p], "Stick deadzone", "Left stick travel ignored (%).",
+            RECOMP_RUNTIME_UI_INT, 5, 95, 5, NULL, 0, NULL);
+        snprintf(s_reset_key[p], sizeof(s_reset_key[p]), "cyc.input.%d.reset", p);
+        add(s_reset_key[p], s_pad_section[p], "Reset controller buttons",
+            "A = A, B = X, Select = View, Start = Menu, D-pad.",
+            RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, NULL, 0, NULL);
+    }
+    pad_labels();
+}
+
+static void status(const char *text)
+{
+    snprintf(s_status, sizeof(s_status), "%s", text);
+    recomp_runtime_ui_set_status(s_ui, s_status);
+}
+
+bool cyc_ui_capturing(void) { return s_capture_p >= 0; }
+
+void cyc_ui_capture_input(int binding)
+{
+    if (s_capture_p < 0) return;
+    int p = s_capture_p, b = s_capture_b;
+    s_capture_p = s_capture_b = -1;
+    CycBindings *bind = &s_host.settings->bind;
+    char name[64], msg[128];
+    pad_name(binding, name, sizeof(name));
+    if (!binding) {
+        status("Unchanged");
+    } else if (binding == bind->shortcut[CYC_SC_MENU].pad) {
+        snprintf(msg, sizeof(msg), "%s opens this menu; choose another button", name);
+        status(msg);
+    } else {
+        bind->button[p][b].pad = binding;
+        if (s_host.save) s_host.save();
+        int clash = -1;
+        for (int s = 0; s < CYC_SC_COUNT; ++s) if (bind->shortcut[s].pad == binding) clash = s;
+        if (clash >= 0)
+            snprintf(msg, sizeof(msg), "Player %d %s = %s (also %s, which wins while held)", p + 1,
+                     NES_BUTTON[b], name, cyc_shortcut_label(clash));
+        else
+            snprintf(msg, sizeof(msg), "Player %d %s = %s", p + 1, NES_BUTTON[b], name);
+        status(msg);
+    }
+    pad_labels();
+}
 
 /* ---- Mods: every feature of the mod runtime's catalog (cyc_session.h), with
  * its options, edited live. A change goes to the runtime (the same calls the
@@ -348,6 +475,8 @@ static int get_value(void *ctx, const RecompRuntimeUiItem *it, int *out)
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE)) *out = s->integer_scale;
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER)) *out = s->linear_filter;
     else if (is_key(it, "cyc.shader")) *out = shader_index();
+    else if (key_player(it, s_src_key) >= 0) *out = s->bind.source[key_player(it, s_src_key)];
+    else if (key_player(it, s_dz_key) >= 0) *out = s->bind.deadzone[key_player(it, s_dz_key)];
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_AUDIO)) *out = s->audio_enabled;
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_VOLUME)) *out = s->volume;
     else if (is_key(it, "cyc.zapper.mouse")) *out = s->zapper_mouse;
@@ -378,6 +507,8 @@ static int set_value(void *ctx, const RecompRuntimeUiItem *it, int v)
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE)) s->integer_scale = v != 0;
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER)) s->linear_filter = v != 0;
     else if (is_key(it, "cyc.shader")) set_shader_index(v);
+    else if (key_player(it, s_src_key) >= 0) s->bind.source[key_player(it, s_src_key)] = v < 0 ? 0 : v > 2 ? 2 : v;
+    else if (key_player(it, s_dz_key) >= 0) s->bind.deadzone[key_player(it, s_dz_key)] = v < 5 ? 5 : v > 95 ? 95 : v;
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_AUDIO)) s->audio_enabled = v != 0;
     else if (is_key(it, RECOMP_RUNTIME_UI_KEY_VOLUME)) s->volume = v < 0 ? 0 : v > 100 ? 100 : v;
     else if (is_key(it, "cyc.zapper.mouse")) s->zapper_mouse = v != 0;
@@ -411,6 +542,27 @@ static int run_action(void *ctx, const RecompRuntimeUiItem *it)
     const CycHostExtras *x = s_host.extras;
     long f = s_host.frames_done();
     if (is_key(it, RECOMP_RUNTIME_UI_KEY_RESUME)) { recomp_runtime_ui_close(s_ui); return 1; }
+    int pp, pb;
+    if (pad_row(it, &pp, &pb)) {
+        s_capture_p = pp;
+        s_capture_b = pb;
+        pad_labels();
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Press a controller button for Player %d %s (Backspace cancels)", pp + 1, NES_BUTTON[pb]);
+        status(msg);
+        return 1;
+    }
+    if (key_player(it, s_reset_key) >= 0) {
+        int p = key_player(it, s_reset_key);
+        CycBindings d;
+        cyc_bindings_default(&d);
+        for (int b = 0; b < CYC_INPUT_BUTTONS; ++b) s_host.settings->bind.button[p][b].pad = d.button[p][b].pad;
+        s_host.settings->bind.deadzone[p] = d.deadzone[p];
+        if (s_host.save) s_host.save();
+        pad_labels();
+        status("Controller buttons reset");
+        return 1;
+    }
     if (is_key(it, "cyc.disk.eject")) {
         CycDiskToast t;
         cyc_disk_action_toast(cyc_host_disk_action(), s_host.now_ms(), &t);
@@ -490,6 +642,8 @@ static void visibility(void *ctx, int open)
 {
     (void)ctx;
     s_quit_armed = 0;
+    s_capture_p = s_capture_b = -1;          /* closing the menu gives up a capture */
+    pad_labels();
     if (open) refresh();
 }
 
@@ -525,10 +679,11 @@ RecompRuntimeUi *cyc_ui_menu_create(const CycUiHost *host)
                 HLE_CHOICES, 3, HLE_VALUES);
         }
     }
+    add_pad_rows();
     for (int i = 0; i < CYC_SC_COUNT; ++i) {
         if (i == CYC_SC_DISK && !host->fds) continue;
         snprintf(s_shortcut_key[i], sizeof(s_shortcut_key[i]), "cyc.shortcut.%d", i);
-        add(s_shortcut_key[i], "Controls", s_shortcut_label[i], "Change bindings in the launcher's Controls page.",
+        add(s_shortcut_key[i], "Controls", s_shortcut_label[i], "Change shortcuts in the launcher's Controls page.",
             RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, NULL, 0, NULL);
     }
     if (x && x->menu_items)

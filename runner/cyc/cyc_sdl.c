@@ -1154,6 +1154,12 @@ static void show(bool loading, const char *toast_title, const char *toast_body)
 static void menu_nav_key(const SDL_KeyboardEvent *k)
 {
 #ifdef CYC_WITH_RECOMP_UI
+    if (cyc_ui_capturing()) {
+        /* waiting for a controller button: Backspace / Escape give up, other keys wait */
+        if (k->keysym.scancode == SDL_SCANCODE_BACKSPACE || k->keysym.scancode == SDL_SCANCODE_ESCAPE)
+            cyc_ui_capture_input(0);
+        return;
+    }
     int in = -1;
     switch (k->keysym.scancode) {
     case SDL_SCANCODE_UP: in = RECOMP_RUNTIME_UI_INPUT_UP; break;
@@ -1334,8 +1340,19 @@ int cyc_sdl_main(const char *title_in, int scale)
 #endif
                 if (open) menu_nav_key(&ev.key);
             } else if (ev.type == SDL_CONTROLLERBUTTONDOWN && open) {
+#ifdef CYC_WITH_RECOMP_UI
+                /* a controller row waiting for its new button takes this one */
+                if (cyc_ui_capturing()) { cyc_ui_capture_input(CYC_PAD_BUTTON(ev.cbutton.button)); continue; }
+#endif
                 menu_nav_button(ev.cbutton.button);
             }
+#ifdef CYC_WITH_RECOMP_UI
+            else if (ev.type == SDL_CONTROLLERAXISMOTION && open && cyc_ui_capturing() &&
+                     (ev.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT ||
+                      ev.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT) && ev.caxis.value > 16384) {
+                cyc_ui_capture_input(CYC_PAD_AXIS(ev.caxis.axis, 1));   /* a trigger pulled past half */
+            }
+#endif
         }
 
         /* the actions */

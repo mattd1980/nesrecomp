@@ -80,6 +80,11 @@ bool cyc_ui_menu_open(void);
 void cyc_ui_toggle_menu(void);
 /* Menu navigation (RecompRuntimeUiInput values). */
 void cyc_ui_nav(int input, bool repeat);
+/* A controller-binding row is waiting for its new button (Player N controls).
+ * The window hands it the next controller button or trigger as a
+ * cyc_input.h CYC_PAD_* value; 0 cancels. */
+bool cyc_ui_capturing(void);
+void cyc_ui_capture_input(int binding);
 /* The toast (NULL, NULL clears it). */
 void cyc_ui_set_toast(const char *title, const char *body);
 /* Draw the menu and the toast over what the renderer holds (the picture and
