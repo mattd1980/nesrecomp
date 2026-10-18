@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { buttons, compileProfile, createEngine, printable } from './engine.mjs';
+import { buttons, compileProfile, createEngine, nameColor, printable } from './engine.mjs';
 import { chatMessage, parseIrcLine } from './irc.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -33,6 +33,8 @@ test('chat text is reduced to what the in-game font draws', () => {
   assert.equal(printable('Ça marche \u{1F389}  très   bien'), 'Ca marche tres bien');
   assert.equal(printable('x'.repeat(300)).length, 200);
   assert.equal(buttons('a+left'), 0x82);
+  assert.equal(nameColor({ color: '#0000FF', login: 'x' }), '7373FF'); // too dark: lifted
+  assert.equal(nameColor({ color: '#FFD700', login: 'x' }), 'FFD700');
 });
 
 test('every bundled profile compiles', () => {
