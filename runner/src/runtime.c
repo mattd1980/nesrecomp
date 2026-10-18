@@ -1832,8 +1832,6 @@ void ppu_write_reg(uint16_t reg, uint8_t val) {
             break;
         case 0x2001:
             g_ppumask = g_ppumask_translate ? nes_ppumask_to_runner(val) : val;
-            if (g_ppumask_translate)
-                g_ppumask |= 0x1E;
             if (getenv("NESRECOMP_TRACE_PPUMASK"))
                 fprintf(stderr, "[MASK] f=%llu cyc=%llu val=$%02X depth=%d\n",
                         (unsigned long long)g_frame_count,
