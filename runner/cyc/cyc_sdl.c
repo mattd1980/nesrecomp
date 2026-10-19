@@ -619,6 +619,40 @@ static void tcp_action(int id, const char *line)
     cyc_tcp_err(id, "action: a shortcut (disk, menu, fast_forward, screenshot, fullscreen) or a button (a ... right)");
 }
 
+/* Frame-exact driving for bots: once a step arrives the game only runs the
+ * frames steps ask for, unpaced, with exactly their buttons on pad 1 (NES
+ * order, A = 0x80 ... Right = 0x01); the reply comes when the last one ran.
+ * release true hands the game back to the clock and the real inputs. */
+static bool    s_step_armed;
+static long    s_step_left;
+static uint8_t s_step_buttons;
+static int     s_step_id;
+
+static void tcp_step(int id, const char *line)
+{
+    bool release = false;
+    if (cyc_tcp_bool(line, "release", &release) && release) {
+        s_step_armed = false;
+        s_step_left = 0;
+        cyc_tcp_ok(id, NULL);
+        return;
+    }
+    if (s_step_left) { cyc_tcp_err(id, "step: the previous step is still running"); return; }
+    long frames = 1, buttons = 0;
+    cyc_tcp_long(line, "frames", &frames);
+    cyc_tcp_long(line, "buttons", &buttons);
+    s_step_armed = true;
+    s_step_buttons = (uint8_t)buttons;
+    if (frames < 1) {                       /* frames 0: just stop the clock */
+        char f[64];
+        snprintf(f, sizeof(f), "\"frame\":%ld", s_frames_done);
+        cyc_tcp_ok(id, f);
+        return;
+    }
+    s_step_left = frames > 36000 ? 36000 : frames;
+    s_step_id = id;
+}
+
 static void tcp_state(int id, const char *line)
 {
     (void)line;
@@ -995,6 +1029,7 @@ static void tcp_setup(void)
     cyc_tcp_register("write_ram", "store CPU RAM bytes as the CPU would: addr, hex", tcp_write_ram);
     cyc_tcp_register("touch", "a finger on the window: x, y (0..1000), finger, down", tcp_touch);
     cyc_tcp_register("ring_dump", "the always-on event ring to a file: path, first, last", tcp_ring);
+    cyc_tcp_register("step", "run exactly N frames with these pad 1 buttons, then hold: frames, buttons; release true", tcp_step);
     cyc_tcp_register("save_state", "write a save state (cyc_state.h): path", tcp_save_state);
     cyc_tcp_register("load_state", "load a save state: path", tcp_load_state);
     cyc_tcp_register("video", "the presented width: mode stock|16:9|21:9|32:9|fit (optional)", tcp_video);
@@ -1495,8 +1530,10 @@ int cyc_sdl_main(const char *title_in, int scale)
         online=nes_netplay_active();
         if(online&&cyc_net_leaving()){s_running=false;break;}
 #endif
-        if (online || (!open && !inactive)) {
+        bool held = !online && s_step_armed && !s_step_left;
+        if (online || (!open && !inactive && !held)) {
             uint8_t pad0 = st.buttons[0], pad1 = st.buttons[1];
+            if (!online && s_step_armed) { pad0 = s_step_buttons; pad1 = 0; hold_input = false; }
             if (hold_input) {
                 if (pad0 || pad1) pad0 = pad1 = 0;
                 else hold_input = false;
@@ -1527,7 +1564,17 @@ int cyc_sdl_main(const char *title_in, int scale)
             frames++;
             cyc_host_frame_done(++s_frames_done);
             loading = s_fds && cyc_host_frame_unpaced();
-            fast = !online&&(st.shortcut[CYC_SC_FAST_FORWARD] || loading);
+            fast = !online&&(st.shortcut[CYC_SC_FAST_FORWARD] || loading || s_step_armed);
+            if (!online && s_step_left && --s_step_left == 0) {
+                char f[64];
+                snprintf(f, sizeof(f), "\"frame\":%ld", s_frames_done);
+                cyc_tcp_ok(s_step_id, f);
+            }
+        }
+        if (held) {                         /* a bot holds the clock: just answer its commands */
+            SDL_Delay(1);
+            next = SDL_GetPerformanceCounter();
+            continue;
         }
         int16_t pcm[4096];
         size_t n;
