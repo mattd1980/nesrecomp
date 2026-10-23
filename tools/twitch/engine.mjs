@@ -1,7 +1,10 @@
-// engine.mjs - what a chat message does to the game, from a game profile
-// (profiles/*.json, described in README.md): every message goes to the chat
+// engine.mjs - what a chat message does to the game. A profile is layered
+// from the libraries, the game file and the streamer's settings
+// (layerProfile, described in README.md); every message goes to the chat
 // panel, and a !command that passes its permission, cooldown and game-state
 // checks runs its steps through the window's chat_* requests (cyc_chat.h).
+
+import { defaultSteps } from './library/semantic.mjs';
 
 const BUTTONS = { a: 0x80, b: 0x40, select: 0x20, start: 0x10, up: 0x08, down: 0x04, left: 0x02, right: 0x01 };
 const NAME_COLORS = ['FF4A4A', '4A8CFF', '3CC83C', 'FFB43C', 'C864FF', '3CD2D2', 'FF6EB4', 'B4DC3C'];
@@ -56,37 +59,117 @@ export function nameColor(msg) {
   return NAME_COLORS[h % NAME_COLORS.length];
 }
 
-// One step of a command -> [request, fields] for the window, or a wait.
-function compileStep(step, where) {
+// ---- vars: what a game's RAM means ----
+
+const ENCODINGS = ['bin', 'bin_be', 'bcd', 'digits'];
+
+// A var as its game file gives it: one storage ({addr, enc, len, base}) or a
+// list of them (a number kept in two places, like a coin tally and the
+// status bar's digits), plus bounds and a step in the var's own units.
+function compileVar(name, def) {
+  const list = Array.isArray(def) ? def : [def];
+  if (!list.length) throw new Error(`var ${name}: no storage`);
+  const head = list[0];
+  const storages = list.map((s, i) => {
+    const enc = s.enc ?? 'bin';
+    if (!ENCODINGS.includes(enc)) throw new Error(`var ${name}[${i}]: enc ${enc} (${ENCODINGS.join(', ')})`);
+    return { addr: num(s.addr, 'address'), enc, len: num(s.len ?? 1), base: num(s.base ?? 0) };
+  });
+  const top = (s) => (s.enc === 'digits' ? 10 ** s.len - 1 : s.enc === 'bcd' ? 100 ** s.len - 1 : 256 ** s.len - 1) - s.base;
+  const min = num(head.min ?? 0);
+  const max = num(head.max ?? top(storages[0]));
+  if (min > max) throw new Error(`var ${name}: min above max`);
+  return { name, storages, min, max, step: head.step === undefined ? undefined : num(head.step) };
+}
+
+function varValue(v, x, where) {
+  if (typeof x === 'number') return x;
+  switch (x) {
+    case 'min': return v.min;
+    case 'max': return v.max;
+    case 'min+1': return v.min + 1;
+    case 'step': return v.step;
+    case '-step': return -v.step;
+    default: return num(x, `${where} value`);
+  }
+}
+
+// A var step -> one chat_ram per storage, in raw units (base added).
+function compileVarStep(s, vars, where) {
+  const v = vars[s.name];
+  if (!v) throw new Error(`${where}: no var ${s.name}`);
+  const op = ['set', 'add'].filter((k) => k in s);
+  if (op.length !== 1) throw new Error(`${where}: var needs set or add`);
+  const value = varValue(v, s[op[0]], where);
+  if (value === undefined) throw new Error(`${where}: var ${s.name} has no step`);
+  const lo = Math.max(v.min, s.min === undefined ? v.min : varValue(v, s.min, where));
+  const hi = Math.min(v.max, s.max === undefined ? v.max : varValue(v, s.max, where));
+  return v.storages.map((st, i) => {
+    const f = { addr: st.addr, enc: st.enc, len: st.len, [op[0]]: op[0] === 'set' ? value + st.base : value,
+      min: lo + st.base, max: hi + st.base };
+    for (const k of ['frames', 'every']) if (k in s) f[k] = num(s[k]);
+    if (s.label && i === 0) f.label = printable(s.label, 38);
+    return ['chat_ram', f];
+  });
+}
+
+// One step of a command -> [[request, fields], ...] for the window (a wait
+// or a glitch is resolved when the command runs).
+function compileStep(step, where, vars) {
   const keys = Object.keys(step);
-  if (keys.length !== 1) throw new Error(`${where}: a step has exactly one of ram, pad, call, banner, wait_ms`);
+  if (keys.length !== 1) throw new Error(`${where}: a step has exactly one kind`);
   const [kind] = keys;
   const s = step[kind];
+  const label = (f) => { if (s.label) f.label = printable(s.label, 38); return f; };
   switch (kind) {
     case 'ram': {
       const f = { addr: num(s.addr, 'address') };
       const ops = ['set', 'add', 'or', 'and'].filter((k) => k in s);
       if (ops.length !== 1) throw new Error(`${where}: ram needs one of set, add, or, and`);
       f[ops[0]] = num(s[ops[0]]);
-      for (const k of ['min', 'max', 'frames', 'every', 'if_addr', 'if_eq']) if (k in s) f[k] = num(s[k]);
-      if (s.label) f.label = printable(s.label, 38);
-      return ['chat_ram', f];
+      if (s.enc) f.enc = s.enc;
+      for (const k of ['len', 'min', 'max', 'frames', 'every', 'if_addr', 'if_eq']) if (k in s) f[k] = num(s[k]);
+      return [['chat_ram', label(f)]];
     }
+    case 'var':
+      return compileVarStep(s, vars, where);
     case 'pad': {
       const f = { buttons: buttons(s.buttons), mode: s.mode ?? 'press', frames: num(s.frames ?? 30) };
-      if (!['press', 'tap', 'block', 'invert'].includes(f.mode)) throw new Error(`${where}: pad mode ${f.mode}`);
-      if (s.label) f.label = printable(s.label, 38);
-      return ['chat_pad', f];
+      if (!['press', 'tap', 'block', 'invert', 'swap', 'lag', 'drunk'].includes(f.mode)) throw new Error(`${where}: pad mode ${f.mode}`);
+      if ('delay' in s) f.delay = num(s.delay);
+      return [['chat_pad', label(f)]];
     }
+    case 'fx': {
+      const f = { effect: String(s.effect), ms: num(s.ms ?? 10000) };
+      for (const k of ['amount', 'x', 'y']) if (k in s) f[k] = num(s[k]);
+      if (s.follow) f.follow = s.follow;
+      if (s.color) f.color = String(s.color);
+      return [['chat_fx', label(f)]];
+    }
+    case 'time': {
+      if (!['speed', 'stop'].includes(s.mode)) throw new Error(`${where}: time mode speed or stop`);
+      const f = { mode: s.mode, ms: num(s.ms ?? 5000) };
+      if ('percent' in s) f.percent = num(s.percent);
+      return [['chat_time', label(f)]];
+    }
+    case 'audio':
+      return [['chat_audio', label({ mute: num(s.mute ?? 63), ms: num(s.ms ?? 5000) })]];
+    case 'rewind':
+      return [['chat_rewind', { seconds: num(s.seconds ?? 5) }]];
+    case 'checkpoint':
+      if (!['save', 'load'].includes(s)) throw new Error(`${where}: checkpoint save or load`);
+      return [['chat_checkpoint', { do: s }]];
+    case 'glitch':
+      return [['glitch', { lo: num(s.from ?? 0), hi: num(s.to ?? 0x7ff) }]];
     case 'call': {
       const f = { addr: num(s.addr, 'address') };
       for (const k of ['a', 'x', 'y']) if (k in s) f[k] = num(s[k]);
-      return ['chat_call', f];
+      return [['chat_call', f]];
     }
     case 'banner':
-      return ['chat_banner', typeof s === 'string' ? { text: s } : { ...s }];
+      return [['chat_banner', typeof s === 'string' ? { text: s } : { ...s }]];
     case 'wait_ms':
-      return ['wait', { ms: num(s) }];
+      return [['wait', { ms: num(s) }]];
     default:
       throw new Error(`${where}: unknown step ${kind}`);
   }
@@ -106,15 +189,58 @@ function compileWhen(when, conditions, where) {
   });
 }
 
+// One profile from the layers, later ones winning: the libraries (universal,
+// then semantic, whose commands need the game's vars), the game file, then
+// the streamer's settings. A command named again replaces the earlier one;
+// "disable" removes commands by name; scalar settings and the chat and vote
+// sections merge key by key.
+export function layerProfile(layers) {
+  const out = { commands: {}, aliases: {}, conditions: {}, vars: {}, rewards: {}, chat: {}, vote: {} };
+  const disabled = new Set();
+  for (const layer of layers.filter(Boolean)) {
+    for (const [k, val] of Object.entries(layer)) {
+      if (['commands', 'aliases', 'conditions', 'vars', 'rewards', 'chat', 'vote'].includes(k)) Object.assign(out[k], val);
+      else if (k === 'disable') for (const n of val) disabled.add(n.toLowerCase());
+      else if (k !== 'match' && k !== 'library') out[k] = val;
+    }
+    // per-command tweaks ({ "star": { "cooldown_ms": 5000 } }) merge into the named command
+    for (const [n, tweak] of Object.entries(layer.tweak ?? {})) if (out.commands[n]) out.commands[n] = { ...out.commands[n], ...tweak };
+  }
+  delete out.tweak;
+  const have = new Set(Object.keys(out.vars));
+  for (const [n, c] of Object.entries(out.commands))
+    if (disabled.has(n.toLowerCase()) || (c.requires ?? []).some((r) => !have.has(r))) delete out.commands[n];
+  for (const [a, n] of Object.entries(out.aliases)) if (!out.commands[n]) delete out.aliases[a];
+  // library commands gated on "playing" run ungated in a game that names no such state
+  if (!out.conditions.playing) out.conditions.playing = [];
+  if (out.vote.pool) out.vote.pool = out.vote.pool.filter((n) => out.commands[n]);
+  return out;
+}
+
+// Where the player is on the screen, in NES pixels: { x, y }, each an
+// address or { addr, minus } (a world position less the camera's).
+function compileScreen(s) {
+  if (!s) return null;
+  const one = (c, k) => {
+    if (c === undefined) throw new Error(`player_screen: no ${k}`);
+    return typeof c === 'object' ? { addr: num(c.addr, 'address'), minus: c.minus === undefined ? undefined : num(c.minus, 'address') }
+      : { addr: num(c, 'address') };
+  };
+  return { x: one(s.x, 'x'), y: one(s.y, 'y') };
+}
+
 export function compileProfile(profile) {
   const conditions = {};
   for (const [name, list] of Object.entries(profile.conditions ?? {})) conditions[name] = compileWhen(list, {}, name);
+  const vars = {};
+  for (const [name, def] of Object.entries(profile.vars ?? {})) vars[name] = compileVar(name, def);
+  for (const [name, step] of Object.entries(defaultSteps)) if (vars[name] && vars[name].step === undefined) vars[name].step = step;
   const commands = new Map();
   for (const [name, c] of Object.entries(profile.commands ?? {})) {
     const where = `!${name}`;
     const variants = (c.variants ?? [c]).map((v, i) => ({
       when: compileWhen(v.when ?? c.when, conditions, `${where} variant ${i}`),
-      steps: (v.steps ?? []).map((s) => compileStep(s, where)),
+      steps: (v.steps ?? []).flatMap((s) => compileStep(s, where, vars)),
       banner: v.banner ?? c.banner,
     }));
     commands.set(name.toLowerCase(), {
@@ -152,11 +278,14 @@ export function compileProfile(profile) {
     name: profile.name ?? 'game',
     prefix: profile.prefix ?? '!',
     chat: profile.chat ?? {},
+    rewind: profile.rewind ?? true,
     globalCooldownMs: profile.cooldown_ms ?? 1500,
     userCooldownMs: profile.user_cooldown_ms ?? 8000,
     commands,
     aliases,
     rewards,
+    vars,
+    playerScreen: compileScreen(profile.player_screen),
   };
 }
 
@@ -188,6 +317,14 @@ export function createEngine(profile, { game, now = () => Date.now(), log = () =
   const users = new Map();
   let lastEffect = -Infinity;
   let queue = Promise.resolve();
+
+  // A random byte at a random address in lo..hi, never the stack page.
+  function glitchStore({ lo, hi }) {
+    let addr;
+    do addr = lo + Math.floor(random() * (hi - lo + 1));
+    while (addr >= 0x100 && addr <= 0x1ff);
+    return { addr, set: Math.floor(random() * 256) };
+  }
 
   async function readByte(addr) {
     const r = await game.send('read_ram', { addr, len: 1 });
@@ -228,17 +365,44 @@ export function createEngine(profile, { game, now = () => Date.now(), log = () =
       if (batch.length) await game.batch(batch);
       batch = [];
     };
+    const follow = [];
     for (const [req, fields] of v.steps) {
       if (req === 'wait') {
         await flush();
         await wait(fields.ms);
+      } else if (req === 'chat_fx' && fields.follow) {
+        const { follow: _, ...rest } = fields;
+        batch.push([req, rest]);
+        if (p.playerScreen) follow.push(rest);
       } else {
-        batch.push([req, req === 'chat_banner' ? { ...fields, text: fill(fields.text, msg, cmd) } : fields]);
+        batch.push(req === 'glitch' ? ['chat_ram', glitchStore(fields)]
+          : [req, req === 'chat_banner' ? { ...fields, text: fill(fields.text, msg, cmd) } : fields]);
       }
     }
     if (v.banner) batch.push(['chat_banner', { text: fill(v.banner, msg, cmd), color: 'FFD25A', ms: 2500 }]);
     await flush();
+    for (const f of follow) followPlayer(f); // runs on its own, beside the queue
     return { ran: true };
+  }
+
+  // Keep a picture effect centred on the player (the game file's
+  // player_screen) for as long as it lasts.
+  async function followPlayer(fields) {
+    const end = now() + fields.ms;
+    let geo = { width: 256, native_x0: 0 };
+    try { geo = await game.send('video'); } catch { /* a window without widths: 256 */ }
+    const at = async ({ addr, minus }) => {
+      const v = await readByte(addr);
+      return minus === undefined ? v : (v - (await readByte(minus)) + 256) % 256;
+    };
+    while (now() < end - 100 && game.connected) {
+      try {
+        const x = await at(p.playerScreen.x), y = await at(p.playerScreen.y);
+        await game.send('chat_fx', { ...fields, ms: end - now(),
+          x: Math.round(((geo.native_x0 ?? 0) + x + 8) * 100 / (geo.width || 256)), y: Math.round((y + 12) * 100 / 240) });
+      } catch { return; }
+      await wait(80);
+    }
   }
 
   function lookup(text) {
@@ -382,6 +546,7 @@ export function createEngine(profile, { game, now = () => Date.now(), log = () =
     const fields = {};
     for (const k of ['show', 'side', 'valign', 'offset', 'lines', 'ms', 'scale']) if (k in c) fields[k] = c[k];
     if (Object.keys(fields).length) await game.send('chat_config', fields);
+    await game.send('chat_rewind', { on: p.rewind });
   }
 
   // The vote loop the bridge runs: a round every duration + gap while voting is on.

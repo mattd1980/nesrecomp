@@ -1,0 +1,65 @@
+{
+  "name": "Mega Man 3",
+  "match": { "crc32": ["603AAA57"], "sha1": ["6780b3fcc547c013ee45afac6bb30c6fc6d8b46e"] },
+  "chat": { "side": "right", "valign": "bottom", "offset": 4, "lines": 7, "ms": 20000 },
+  "vote": {
+    "mode": "both",
+    "options": 3,
+    "duration_ms": 20000,
+    "gap_ms": 15000,
+    "y": 12,
+    "title": "CHAT VOTE"
+  },
+  "conditions": {
+    "playing": [
+      { "addr": "0x00A2", "min": "0x81", "_": "Mega Man's HP ($80 + 0..28): in a stage and alive" }
+    ]
+  },
+  "player_screen": { "x": { "addr": "$0360", "minus": "$FC" }, "y": "$03C0", "_": "Mega Man's X less the camera's; Y" },
+  "vars": {
+    "health": { "addr": "$A2", "base": "0x80", "min": 0, "max": 28, "step": 4, "_": "Mega Man: $80 + 0..28" },
+    "lives": { "addr": "$AE", "max": 9 }
+  },
+  "aliases": {
+    "e": "etank"
+  },
+  "rewards": {},
+  "commands": {
+    "etank": {
+      "title": "E-TANK",
+      "help": "an Energy Tank (up to 9)",
+      "cooldown_ms": 120000,
+      "when": "playing",
+      "banner": "{user}: E-TANK!",
+      "steps": [
+        { "ram": { "addr": "0x00AF", "add": 1, "max": 9 } }
+      ]
+    },
+    "shoot": {
+      "title": "RAPID FIRE",
+      "help": "2 s of rapid fire",
+      "cooldown_ms": 8000,
+      "when": "playing",
+      "steps": [
+        { "pad": { "buttons": "b", "mode": "tap", "frames": 120, "label": "RAPID FIRE" } }
+      ]
+    },
+    "slide": {
+      "help": "a slide",
+      "cooldown_ms": 3000,
+      "when": "playing",
+      "steps": [
+        { "pad": { "buttons": "down+a", "mode": "press", "frames": 12 } }
+      ]
+    },
+    "noshoot": {
+      "title": "BUSTER JAMMED",
+      "help": "5 s without shooting",
+      "cooldown_ms": 60000,
+      "when": "playing",
+      "steps": [
+        { "pad": { "buttons": "b", "mode": "block", "frames": 300, "label": "BUSTER JAMMED" } }
+      ]
+    }
+  }
+}

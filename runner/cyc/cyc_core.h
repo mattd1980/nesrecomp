@@ -205,6 +205,9 @@ const uint8_t *cyc_frame_bg_opaque(void);
  * if the machine has no audio output. */
 bool   cyc_audio_enable(int sample_rate);
 size_t cyc_audio_read(int16_t *out, size_t max);
+/* Silence channels in the output only (bits: pulse 1, pulse 2, triangle,
+ * noise, DMC, cartridge audio); the APU state is untouched. */
+void   cyc_audio_mute(uint8_t mask);
 /* Which console's analog output stage shapes the audio (hw_apu.c):
  *   NES      the front-loader's 90 Hz and 440 Hz high-pass and 14 kHz
  *            low-pass (nesdev APU Mixer);
