@@ -179,6 +179,8 @@ static void exe_path(char *out, size_t n, const char *name)
     else snprintf(out, n, "%s", name);
 }
 
+static char s_rom_path[1024];        /* the ROM the window opened (the chat's rom_info) */
+
 int cyc_sdl_prelaunch(const char **rom_path, const char *cli_bios, NesFdsHleAsk *saved_hle,
                       const char **saved_bios)
 {
@@ -228,6 +230,7 @@ int cyc_sdl_prelaunch(const char **rom_path, const char *cli_bios, NesFdsHleAsk 
         return 1;
     }
     if (s_extras && s_extras->set_view_mode && s_set.view_mode) s_extras->set_view_mode(s_extras->ctx, s_set.view_mode);
+    snprintf(s_rom_path, sizeof(s_rom_path), "%s", *rom_path ? *rom_path : "");
     *saved_hle = s_set.fds_hle;
     *saved_bios = s_set.fds_bios[0] ? s_set.fds_bios : NULL;
 #if defined(NESRECOMP_CYCLE_HDPACK) && !defined(NESRECOMP_CYCLE_HDPACK_MODS)
@@ -322,6 +325,24 @@ static bool load_state_from(const char *path, char *err, size_t n)
     cyc_session_state_loaded();
     return true;
 }
+
+/* The chat's view of the window (cyc_chat.h). */
+static bool chat_online(void)
+{
+#ifdef NESRECOMP_NET
+    return nes_netplay_active();
+#else
+    return false;
+#endif
+}
+
+static void chat_state_loaded(void)          /* a rewind or checkpoint, as load_state_from */
+{
+    s_frames_done = (long)cyc_ring_frame;
+    cyc_session_state_loaded();
+}
+
+static const char *chat_rom_path(void) { return s_rom_path; }
 
 static bool save_state_slot(void)
 {
@@ -1002,6 +1023,8 @@ static void tcp_setup(void)
     cyc_tcp_register("window_size", "resize the window (Fit follows its drawable): w, h", tcp_window_size);
     cyc_tcp_register("mod_stats", "hook sites, isolated calls, compositor counts", tcp_mod_stats);
     cyc_tcp_register("quit", "close the window (the disk save is written first)", tcp_quit);
+    const CycChatHost chat = { chat_online, chat_state_loaded, chat_rom_path };
+    cyc_chat_set_host(&chat);
     cyc_chat_register_tcp();
     if (s_extras && s_extras->tcp_setup) s_extras->tcp_setup(s_extras->ctx);
     if (cyc_tcp_start(port)) printf("[cyc tcp] listening on 127.0.0.1:%d\n", port);
@@ -1133,7 +1156,7 @@ static void present_shot(long frame)
 static void show(bool loading, const char *toast_title, const char *toast_body)
 {
     int w, h;
-    const uint32_t *pic = picture(&w, &h);
+    const uint32_t *pic = cyc_chat_picture(picture(&w, &h), w, h);   /* chat's picture effects, if any */
     if (!ensure_texture(w, h)) return;
 #ifndef CYC_WITH_RECOMP_UI
     /* no runtime UI: the toast goes into a copy of the picture */
@@ -1498,7 +1521,8 @@ int cyc_sdl_main(const char *title_in, int scale)
         online=nes_netplay_active();
         if(online&&cyc_net_leaving()){s_running=false;break;}
 #endif
-        if (online || (!open && !inactive)) {
+        cyc_audio_mute(online ? 0 : cyc_chat_muted());
+        if (online || (!open && !inactive && !cyc_chat_frozen())) {
             uint8_t pad0 = st.buttons[0], pad1 = st.buttons[1];
             if (hold_input) {
                 if (pad0 || pad1) pad0 = pad1 = 0;
@@ -1595,7 +1619,7 @@ int cyc_sdl_main(const char *title_in, int scale)
             next = tnow;
             continue;
         }
-        next += (Uint64)(frame_seconds * (double)freq);
+        next += (Uint64)(frame_seconds * (online ? 1.0 : (double)cyc_chat_pace()) * (double)freq);
         if (next > tnow) {
             Uint32 ms = (Uint32)((next - tnow) * 1000 / freq);
             if (ms > 1) SDL_Delay(ms - 1);

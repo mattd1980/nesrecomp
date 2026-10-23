@@ -3,10 +3,13 @@
  */
 #include "cyc_chat.h"
 
+#include "cyc_core.h"
 #include "cyc_mod.h"
+#include "cyc_state.h"
 #include "cyc_tcp.h"
 
 #include <SDL.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,20 +31,30 @@ typedef struct {
     uint32_t born, life;
 } Msg;
 
-enum { PAD_PRESS, PAD_TAP, PAD_BLOCK, PAD_INVERT };
+enum { PAD_PRESS, PAD_TAP, PAD_BLOCK, PAD_INVERT, PAD_LAG, PAD_DRUNK };
 typedef struct {
     bool    on;
     int     mode;
     uint8_t buttons;
+    int     delay;                   /* lag: frames; drunk: frames between lurches */
     long    left;
     char    label[40];
 } PadFx;
+#define LAG_MAX 120
+static uint8_t s_lag[LAG_MAX];       /* player 1's buttons, the last LAG_MAX frames */
+static unsigned s_lag_at;
+static unsigned s_drunk_seed;        /* a new lurch pattern per drunk effect */
 
 enum { RAM_SET, RAM_ADD, RAM_OR, RAM_AND };
+/* How a number is stored: binary little- or big-endian, packed BCD (most
+ * significant byte first), or one decimal digit per byte (most significant
+ * first, as status bars often keep them). */
+enum { ENC_BIN, ENC_BIN_BE, ENC_BCD, ENC_DIGITS };
 typedef struct {
     bool     on;
     uint16_t addr;
-    int      op, value, lo, hi;
+    int      op, enc, len;
+    long     value, lo, hi;
     long     left, every, tick;
     long     if_addr, if_eq;
     char     label[40];
@@ -76,32 +89,63 @@ static uint8_t swap_bits(uint8_t pad, uint8_t a, uint8_t b)
     return (uint8_t)(pad | (ha ? b : 0) | (hb ? a : 0));
 }
 
+static long ram_decode(uint16_t addr, int enc, int len)
+{
+    long v = 0;
+    for (int i = 0; i < len; ++i) {
+        uint8_t b = cyc_mod_peek((uint16_t)(addr + i));
+        switch (enc) {
+        case ENC_BIN: v |= (long)b << (8 * i); break;
+        case ENC_BIN_BE: v = v << 8 | b; break;
+        case ENC_BCD: v = v * 100 + (b >> 4) * 10 + (b & 15); break;
+        default: v = v * 10 + b % 10; break;
+        }
+    }
+    return v;
+}
+
+static void ram_encode(uint16_t addr, int enc, int len, long v)
+{
+    for (int i = len - 1; i >= 0; --i) {
+        uint8_t b;
+        int at = i;
+        switch (enc) {
+        case ENC_BIN: b = (uint8_t)(v >> (8 * i)); break;
+        case ENC_BIN_BE: b = (uint8_t)v; v >>= 8; break;
+        case ENC_BCD: b = (uint8_t)((v / 10 % 10) << 4 | v % 10); v /= 100; break;
+        default: b = (uint8_t)(v % 10); v /= 10; break;
+        }
+        cyc_mod_poke((uint16_t)(addr + at), b);
+    }
+}
+
 static void ram_store(RamFx *fx)
 {
     uint8_t cond;
     if (fx->if_addr >= 0 && (!cyc_mod_peek_ok((uint16_t)fx->if_addr, &cond) || cond != (uint8_t)fx->if_eq)) return;
-    int v = cyc_mod_peek(fx->addr);
-    switch (fx->op) {
-    case RAM_SET: v = fx->value; break;
-    case RAM_ADD:
-        v += fx->value;
-        if (v < fx->lo) v = fx->lo;
-        if (v > fx->hi) v = fx->hi;
-        break;
-    case RAM_OR: v |= fx->value; break;
-    default: v &= fx->value; break;
+    if (fx->op == RAM_OR || fx->op == RAM_AND) {    /* bits of one byte */
+        uint8_t v = cyc_mod_peek(fx->addr);
+        cyc_mod_poke(fx->addr, (uint8_t)(fx->op == RAM_OR ? v | fx->value : v & fx->value));
+        return;
     }
-    cyc_mod_poke(fx->addr, (uint8_t)v);
+    long v = fx->op == RAM_SET ? fx->value : ram_decode(fx->addr, fx->enc, fx->len) + fx->value;
+    if (v < fx->lo) v = fx->lo;
+    if (v > fx->hi) v = fx->hi;
+    ram_encode(fx->addr, fx->enc, fx->len, v);
 }
+
+static void rewind_record(void);
 
 uint8_t cyc_chat_frame(uint8_t pad)
 {
+    rewind_record();
     for (int i = 0; i < RAM_MAX; ++i) {
         RamFx *fx = &s_ram[i];
         if (!fx->on) continue;
         if (fx->tick++ % fx->every == 0) ram_store(fx);
         if (--fx->left <= 0) fx->on = false;
     }
+    s_lag[s_lag_at++ % LAG_MAX] = pad;     /* what the player pressed, before any effect */
     for (int i = 0; i < PAD_MAX; ++i) {
         PadFx *fx = &s_pad[i];
         if (!fx->on) continue;
@@ -109,9 +153,25 @@ uint8_t cyc_chat_frame(uint8_t pad)
         case PAD_PRESS: pad |= fx->buttons; break;
         case PAD_TAP: if ((fx->left / 8) % 2 == 0) pad |= fx->buttons; break;
         case PAD_BLOCK: pad &= (uint8_t)~fx->buttons; break;
-        default:
+        case PAD_LAG: {                       /* the buttons named come in `delay` frames late */
+            uint8_t late = s_lag[(s_lag_at - 1 - (unsigned)fx->delay) % LAG_MAX];
+            pad = (uint8_t)((pad & ~fx->buttons) | (late & fx->buttons));
+            break;
+        }
+        case PAD_DRUNK:                       /* one of the buttons named, now and then, held a while */
+            if ((fx->left / fx->delay) % 3 == 0) {
+                uint8_t bit[8];
+                int n = 0;
+                for (int b = 0; b < 8; ++b)
+                    if (fx->buttons >> b & 1) bit[n++] = (uint8_t)(1 << b);
+                unsigned spin = (unsigned)(fx->left / fx->delay) * 2654435761u + s_drunk_seed;
+                pad |= bit[(spin >> 16) % (unsigned)n];
+            }
+            break;
+        default:                              /* invert / swap: each pair named trades places */
             if (fx->buttons & 0x03) pad = swap_bits(pad, 0x01, 0x02);
             if (fx->buttons & 0x0C) pad = swap_bits(pad, 0x04, 0x08);
+            if ((fx->buttons & 0xC0) == 0xC0) pad = swap_bits(pad, 0x40, 0x80);
             break;
         }
         if (--fx->left <= 0) fx->on = false;
@@ -136,6 +196,184 @@ static int ram_slot(const char *label)
     for (int i = 0; i < RAM_MAX; ++i)
         if (!s_ram[i].on) return i;
     return -1;
+}
+
+/* ---- the picture, the clock and the sound: effects any game takes ---- */
+
+enum { FX_FLIP_H, FX_FLIP_V, FX_GRAY, FX_NEGATIVE, FX_RAINBOW, FX_TINT, FX_PIXELATE, FX_SHAKE, FX_ZOOM,
+       FX_WOBBLE, FX_SPOTLIGHT, FX_MIRROR, FX_KINDS };
+static const char *const FX_NAMES[FX_KINDS] = { "flip_h", "flip_v", "gray", "negative", "rainbow", "tint",
+    "pixelate", "shake", "zoom", "wobble", "spotlight", "mirror" };
+typedef struct {
+    bool     on;
+    long     amount;
+    uint32_t color, born, life;
+    int      x, y;                   /* spotlight centre, percent of the picture */
+    char     label[40];
+} PicFx;
+static PicFx s_fx[FX_KINDS];         /* one of each kind; a new one replaces it */
+
+static struct { bool on; int percent; uint32_t born, life; char label[40]; } s_speed, s_stop;
+static struct { bool on; uint8_t mask; uint32_t born, life; char label[40]; } s_mute;
+
+#define REWIND_MAX   24              /* one snapshot every REWIND_EVERY frames */
+#define REWIND_EVERY 30
+static struct { uint8_t *data; size_t len; long frame; } s_rewind[REWIND_MAX], s_checkpoint;
+static int  s_rewind_count;
+static long s_rewind_frames;         /* frames run since rewind was switched on */
+static bool s_rewind_on;
+static CycChatHost s_host;
+
+void cyc_chat_set_host(const CycChatHost *host) { s_host = *host; }
+
+static bool live(uint32_t now, uint32_t born, uint32_t life) { return life && now - born < life; }
+
+static bool online(void) { return s_host.online && s_host.online(); }
+
+static void snap_free(uint8_t **data)
+{
+    free(*data);
+    *data = NULL;
+}
+
+static void rewind_record(void)
+{
+    if (!s_rewind_on || s_rewind_frames++ % REWIND_EVERY) return;
+    uint8_t *data;
+    size_t len;
+    char err[128];
+    if (!cyc_state_save(&data, &len, err, sizeof(err))) return;
+    if (s_rewind_count == REWIND_MAX) {
+        snap_free(&s_rewind[0].data);
+        memmove(s_rewind, s_rewind + 1, sizeof(s_rewind[0]) * (REWIND_MAX - 1));
+        s_rewind_count--;
+    }
+    s_rewind[s_rewind_count].data = data;
+    s_rewind[s_rewind_count].len = len;
+    s_rewind[s_rewind_count].frame = s_rewind_frames;
+    s_rewind_count++;
+}
+
+static void rewind_clear(void)
+{
+    for (int i = 0; i < s_rewind_count; ++i) snap_free(&s_rewind[i].data);
+    s_rewind_count = 0;
+}
+
+static bool state_apply(const uint8_t *data, size_t len, char *err, size_t n)
+{
+    if (!cyc_state_load(data, len, err, n)) return false;
+    if (s_host.state_loaded) s_host.state_loaded();
+    return true;
+}
+
+float cyc_chat_pace(void)
+{
+    uint32_t now = SDL_GetTicks();
+    if (s_speed.on && !live(now, s_speed.born, s_speed.life)) s_speed.on = false;
+    return s_speed.on ? 100.0f / (float)s_speed.percent : 1.0f;
+}
+
+bool cyc_chat_frozen(void)
+{
+    if (s_stop.on && !live(SDL_GetTicks(), s_stop.born, s_stop.life)) s_stop.on = false;
+    return s_stop.on;
+}
+
+uint8_t cyc_chat_muted(void)
+{
+    if (s_mute.on && !live(SDL_GetTicks(), s_mute.born, s_mute.life)) s_mute.on = false;
+    return s_mute.on ? s_mute.mask : 0;
+}
+
+static uint32_t hue_rotate(uint32_t c, float cs, float sn)
+{
+    /* rotate the chroma plane of YIQ */
+    float r = (float)(c >> 16 & 255), g = (float)(c >> 8 & 255), b = (float)(c & 255);
+    float y = 0.299f * r + 0.587f * g + 0.114f * b, i = 0.596f * r - 0.274f * g - 0.322f * b,
+          q = 0.211f * r - 0.523f * g + 0.312f * b;
+    float i2 = i * cs - q * sn, q2 = i * sn + q * cs;
+    float rr = y + 0.956f * i2 + 0.621f * q2, gg = y - 0.272f * i2 - 0.647f * q2, bb = y - 1.106f * i2 + 1.703f * q2;
+#define CLAMP8(v) ((uint32_t)((v) < 0 ? 0 : (v) > 255 ? 255 : (v)))
+    return 0xFF000000u | CLAMP8(rr) << 16 | CLAMP8(gg) << 8 | CLAMP8(bb);
+#undef CLAMP8
+}
+
+const uint32_t *cyc_chat_picture(const uint32_t *pic, int w, int h)
+{
+    static uint32_t *out;
+    static size_t out_len;
+    uint32_t now = SDL_GetTicks();
+    bool any = false;
+    for (int k = 0; k < FX_KINDS; ++k) {
+        if (s_fx[k].on && !live(now, s_fx[k].born, s_fx[k].life)) s_fx[k].on = false;
+        any |= s_fx[k].on;
+    }
+    if (!any || w <= 0 || h <= 0) return pic;
+    size_t need = (size_t)w * (size_t)h;
+    if (need > out_len) {
+        free(out);
+        out = (uint32_t *)malloc(need * 4);
+        out_len = out ? need : 0;
+        if (!out) return pic;
+    }
+    const PicFx *f = s_fx;
+    float t = (float)now / 1000.0f;
+    int block = f[FX_PIXELATE].on ? (int)(f[FX_PIXELATE].amount < 2 ? 2 : f[FX_PIXELATE].amount > 32 ? 32 : f[FX_PIXELATE].amount) : 1;
+    int dx = 0, dy = 0;
+    if (f[FX_SHAKE].on) {
+        int a = (int)(f[FX_SHAKE].amount < 1 ? 1 : f[FX_SHAKE].amount > 32 ? 32 : f[FX_SHAKE].amount);
+        dx = rand() % (2 * a + 1) - a;
+        dy = rand() % (2 * a + 1) - a;
+    }
+    float zoom = f[FX_ZOOM].on ? (float)(f[FX_ZOOM].amount < 100 ? 100 : f[FX_ZOOM].amount > 400 ? 400 : f[FX_ZOOM].amount) / 100.0f : 1.0f;
+    float wob = f[FX_WOBBLE].on ? (float)(f[FX_WOBBLE].amount < 1 ? 1 : f[FX_WOBBLE].amount > 32 ? 32 : f[FX_WOBBLE].amount) : 0.0f;
+    /* zoom closes in on x,y (the player, when a bridge follows one) */
+    float cx = (float)w * (float)(f[FX_ZOOM].on ? f[FX_ZOOM].x : 50) / 100.0f, cy = (float)h * (float)(f[FX_ZOOM].on ? f[FX_ZOOM].y : 50) / 100.0f;
+    for (int y = 0; y < h; ++y) {
+        float row_shift = wob ? wob * sinf(6.2831853f * ((float)y / 48.0f + t * 0.8f)) : 0.0f;
+        for (int x = 0; x < w; ++x) {
+            int bx = x - x % block, by = y - y % block;
+            float sx = (float)(bx - dx) + row_shift, sy = (float)(by - dy);
+            if (zoom != 1.0f) { sx = cx + (sx - cx) / zoom; sy = cy + (sy - cy) / zoom; }
+            int ix = (int)sx, iy = (int)sy;
+            if (f[FX_MIRROR].on && ix >= w / 2) ix = w - 1 - ix;
+            if (f[FX_FLIP_H].on) ix = w - 1 - ix;
+            if (f[FX_FLIP_V].on) iy = h - 1 - iy;
+            out[(size_t)y * (size_t)w + (size_t)x] =
+                ix < 0 || iy < 0 || ix >= w || iy >= h ? 0xFF000000u : pic[(size_t)iy * (size_t)w + (size_t)ix];
+        }
+    }
+    float cs = 1, sn = 0;
+    if (f[FX_RAINBOW].on) { cs = cosf(t * 3.0f); sn = sinf(t * 3.0f); }
+    uint32_t tint = f[FX_TINT].on ? f[FX_TINT].color : 0;
+    float spot_x = (float)w * (float)f[FX_SPOTLIGHT].x / 100.0f, spot_y = (float)h * (float)f[FX_SPOTLIGHT].y / 100.0f,
+          spot_r = (float)h * (float)(f[FX_SPOTLIGHT].amount < 5 ? 5 : f[FX_SPOTLIGHT].amount > 100 ? 100 : f[FX_SPOTLIGHT].amount) / 100.0f;
+    bool colour = f[FX_GRAY].on || f[FX_NEGATIVE].on || f[FX_RAINBOW].on || f[FX_TINT].on || f[FX_SPOTLIGHT].on;
+    for (int y = 0; colour && y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            uint32_t *p = &out[(size_t)y * (size_t)w + (size_t)x], c = *p;
+            unsigned r = c >> 16 & 255, g = c >> 8 & 255, b = c & 255;
+            if (f[FX_GRAY].on) r = g = b = (r * 77 + g * 150 + b * 29) >> 8;
+            if (f[FX_NEGATIVE].on) { r = 255 - r; g = 255 - g; b = 255 - b; }
+            c = 0xFF000000u | r << 16 | g << 8 | b;
+            if (f[FX_RAINBOW].on) c = hue_rotate(c, cs, sn);
+            if (tint) {            /* half-way to the colour, keeping the brightness */
+                unsigned l = ((c >> 16 & 255) * 77 + (c >> 8 & 255) * 150 + (c & 255) * 29) >> 8;
+                r = ((c >> 16 & 255) + (tint >> 16 & 255) * l / 255) / 2;
+                g = ((c >> 8 & 255) + (tint >> 8 & 255) * l / 255) / 2;
+                b = ((c & 255) + (tint & 255) * l / 255) / 2;
+                c = 0xFF000000u | r << 16 | g << 8 | b;
+            }
+            if (f[FX_SPOTLIGHT].on) {
+                float ddx = (float)x - spot_x, ddy = (float)y - spot_y, d = sqrtf(ddx * ddx + ddy * ddy);
+                float k = d <= spot_r ? 1.0f : d >= spot_r * 1.35f ? 0.06f : 1.0f - 0.94f * (d - spot_r) / (spot_r * 0.35f);
+                c = 0xFF000000u | (uint32_t)((float)(c >> 16 & 255) * k) << 16 | (uint32_t)((float)(c >> 8 & 255) * k) << 8 |
+                    (uint32_t)((float)(c & 255) * k);
+            }
+            *p = c;
+        }
+    return out;
 }
 
 /* ---- requests ---- */
@@ -233,15 +471,20 @@ static void tcp_poll(int id, const char *line)
 static void tcp_pad(int id, const char *line)
 {
     char mode[16] = "press", label[40] = "";
-    long buttons = 0, frames = 60;
+    long buttons = 0, frames = 60, delay = -1;
     cyc_tcp_str(line, "mode", mode, sizeof(mode));
     cyc_tcp_str(line, "label", label, sizeof(label));
     printable(label);
     cyc_tcp_long(line, "frames", &frames);
+    cyc_tcp_long(line, "delay", &delay);
     int m = !strcmp(mode, "press") ? PAD_PRESS : !strcmp(mode, "tap") ? PAD_TAP
-          : !strcmp(mode, "block") ? PAD_BLOCK : !strcmp(mode, "invert") ? PAD_INVERT : -1;
-    if (!cyc_tcp_long(line, "buttons", &buttons) || buttons <= 0 || buttons > 0xFF || m < 0 || frames < 1) {
-        cyc_tcp_err(id, "chat_pad: buttons (A = 0x80 ... Right = 0x01), mode press|tap|block|invert, frames, label");
+          : !strcmp(mode, "block") ? PAD_BLOCK : !strcmp(mode, "invert") || !strcmp(mode, "swap") ? PAD_INVERT
+          : !strcmp(mode, "lag") ? PAD_LAG : !strcmp(mode, "drunk") ? PAD_DRUNK : -1;
+    if (delay < 0) delay = m == PAD_LAG ? 15 : 10;
+    if (!cyc_tcp_long(line, "buttons", &buttons) || buttons <= 0 || buttons > 0xFF || m < 0 || frames < 1 ||
+        delay < 1 || delay >= LAG_MAX) {
+        cyc_tcp_err(id, "chat_pad: buttons (A = 0x80 ... Right = 0x01), mode press|tap|block|swap|lag|drunk, frames, "
+                        "delay (lag: frames late; drunk: frames per lurch), label");
         return;
     }
     int i = pad_slot(label);
@@ -249,6 +492,8 @@ static void tcp_pad(int id, const char *line)
     PadFx *fx = &s_pad[i];
     fx->on = true;
     fx->mode = m;
+    fx->delay = (int)delay;
+    if (m == PAD_DRUNK) s_drunk_seed = SDL_GetTicks() * 2246822519u;
     fx->buttons = (uint8_t)buttons;
     fx->left = frames > 36000 ? 36000 : frames;
     snprintf(fx->label, sizeof(fx->label), "%s", label);
@@ -261,14 +506,25 @@ static void tcp_ram(int id, const char *line)
 {
     RamFx fx;
     memset(&fx, 0, sizeof(fx));
-    long addr = -1, value = 0, lo = 0, hi = 255, frames = 0, every = 1, if_addr = -1, if_eq = 0;
+    long addr = -1, value = 0, lo = 0, hi = -1, frames = 0, every = 1, if_addr = -1, if_eq = 0, len = 1;
     int op = -1;
     if (cyc_tcp_long(line, "set", &value)) op = RAM_SET;
     else if (cyc_tcp_long(line, "add", &value)) op = RAM_ADD;
     else if (cyc_tcp_long(line, "or", &value)) op = RAM_OR;
     else if (cyc_tcp_long(line, "and", &value)) op = RAM_AND;
+    char enc[16] = "bin";
+    cyc_tcp_str(line, "enc", enc, sizeof(enc));
+    int e = !strcmp(enc, "bin") ? ENC_BIN : !strcmp(enc, "bin_be") ? ENC_BIN_BE : !strcmp(enc, "bcd") ? ENC_BCD
+          : !strcmp(enc, "digits") ? ENC_DIGITS : -1;
+    cyc_tcp_long(line, "len", &len);
+    int max_len = e == ENC_DIGITS ? 8 : 4;
+    /* the largest number the encoding holds in len bytes */
+    long top = 0;
+    for (long i = 0; i < len && i < max_len; ++i)
+        top = e == ENC_DIGITS ? top * 10 + 9 : e == ENC_BCD ? top * 100 + 99 : top << 8 | 0xFF;
+    if (len == 4 && (e == ENC_BIN || e == ENC_BIN_BE)) top = 0x7FFFFFFF;
     cyc_tcp_long(line, "min", &lo);
-    cyc_tcp_long(line, "max", &hi);
+    if (!cyc_tcp_long(line, "max", &hi)) hi = top;
     cyc_tcp_long(line, "frames", &frames);
     cyc_tcp_long(line, "every", &every);
     bool cond = cyc_tcp_long(line, "if_addr", &if_addr);
@@ -276,17 +532,22 @@ static void tcp_ram(int id, const char *line)
     cyc_tcp_str(line, "label", fx.label, sizeof(fx.label));
     printable(fx.label);
     uint8_t probe;
-    if (!cyc_tcp_long(line, "addr", &addr) || addr < 0 || addr > 0xFFFF || op < 0 || value < -255 || value > 255 ||
-        lo < 0 || hi > 255 || lo > hi || frames < 0 || every < 1 || if_addr < -1 || if_addr > 0xFFFF ||
+    bool bits = op == RAM_OR || op == RAM_AND;
+    if (!cyc_tcp_long(line, "addr", &addr) || addr < 0 || addr + len > 0x10000 || op < 0 || e < 0 || len < 1 ||
+        len > max_len || (bits && (len != 1 || value < 0 || value > 255)) || value < -top || value > top ||
+        lo < 0 || hi > top || lo > hi || frames < 0 || every < 1 || if_addr < -1 || if_addr > 0xFFFF ||
         !cyc_mod_peek_ok((uint16_t)addr, &probe)) {
-        cyc_tcp_err(id, "chat_ram: addr (RAM), set|add|or|and, min, max, frames, every, if_addr + if_eq, label");
+        cyc_tcp_err(id, "chat_ram: addr (RAM), set|add|or|and, enc bin|bin_be|bcd|digits, len, min, max, frames, "
+                        "every, if_addr + if_eq, label");
         return;
     }
     fx.addr = (uint16_t)addr;
     fx.op = op;
-    fx.value = (int)value;
-    fx.lo = (int)lo;
-    fx.hi = (int)hi;
+    fx.enc = e;
+    fx.len = (int)len;
+    fx.value = value;
+    fx.lo = lo;
+    fx.hi = hi;
     fx.every = every;
     fx.if_addr = if_addr;
     fx.if_eq = if_eq;
@@ -302,6 +563,156 @@ static void tcp_ram(int id, const char *line)
     s_ram[i] = fx;
     char f[32];
     snprintf(f, sizeof(f), "\"slot\":%d", i);
+    cyc_tcp_ok(id, f);
+}
+
+static long clamp_ms(long ms, long lo, long hi) { return ms < lo ? lo : ms > hi ? hi : ms; }
+
+static void tcp_fx(int id, const char *line)
+{
+    char kind[16] = "", label[40] = "";
+    long ms = 10000, amount = 0, x = 50, y = 50;
+    cyc_tcp_str(line, "effect", kind, sizeof(kind));
+    cyc_tcp_str(line, "label", label, sizeof(label));
+    printable(label);
+    cyc_tcp_long(line, "ms", &ms);
+    cyc_tcp_long(line, "amount", &amount);
+    cyc_tcp_long(line, "x", &x);
+    cyc_tcp_long(line, "y", &y);
+    int k = 0;
+    while (k < FX_KINDS && strcmp(kind, FX_NAMES[k])) ++k;
+    if (k == FX_KINDS) {
+        char e[256] = "chat_fx: effect ";
+        for (int i = 0; i < FX_KINDS; ++i) { strcat(e, FX_NAMES[i]); strcat(e, i + 1 < FX_KINDS ? "|" : ""); }
+        strcat(e, ", ms (0 ends it), amount, color, x, y, label");
+        cyc_tcp_err(id, e);
+        return;
+    }
+    PicFx *f = &s_fx[k];
+    if (ms <= 0) { f->on = false; cyc_tcp_ok(id, NULL); return; }
+    f->on = true;
+    f->amount = amount;
+    f->color = color_field(line, "color", 0xFF4040);
+    f->x = (int)clamp_ms(x, 0, 100);
+    f->y = (int)clamp_ms(y, 0, 100);
+    f->born = SDL_GetTicks();
+    f->life = (uint32_t)clamp_ms(ms, 100, 600000);
+    snprintf(f->label, sizeof(f->label), "%s", label);
+    cyc_tcp_ok(id, NULL);
+}
+
+/* The clock: mode slow|fast (percent of full speed), stop (no frames run). */
+static void tcp_time(int id, const char *line)
+{
+    char mode[16] = "", label[40] = "";
+    long ms = 5000, percent = 50;
+    cyc_tcp_str(line, "mode", mode, sizeof(mode));
+    cyc_tcp_str(line, "label", label, sizeof(label));
+    printable(label);
+    cyc_tcp_long(line, "ms", &ms);
+    cyc_tcp_long(line, "percent", &percent);
+    if (online()) { cyc_tcp_err(id, "chat_time: not during online play"); return; }
+    bool stop = !strcmp(mode, "stop");
+    if (!stop && strcmp(mode, "speed")) {
+        cyc_tcp_err(id, "chat_time: mode speed (percent 10..400) | stop, ms (0 ends it), label");
+        return;
+    }
+    if (stop) {
+        s_stop.on = ms > 0;
+        s_stop.born = SDL_GetTicks();
+        s_stop.life = (uint32_t)clamp_ms(ms, 100, 60000);
+        snprintf(s_stop.label, sizeof(s_stop.label), "%s", label);
+    } else {
+        s_speed.on = ms > 0 && percent != 100;
+        s_speed.percent = (int)clamp_ms(percent, 10, 400);
+        s_speed.born = SDL_GetTicks();
+        s_speed.life = (uint32_t)clamp_ms(ms, 100, 600000);
+        snprintf(s_speed.label, sizeof(s_speed.label), "%s", label);
+    }
+    cyc_tcp_ok(id, NULL);
+}
+
+static void tcp_audio(int id, const char *line)
+{
+    long mask = 0x3F, ms = 5000;
+    char label[40] = "";
+    cyc_tcp_long(line, "mute", &mask);
+    cyc_tcp_long(line, "ms", &ms);
+    cyc_tcp_str(line, "label", label, sizeof(label));
+    printable(label);
+    if (mask < 0 || mask > 0x3F) { cyc_tcp_err(id, "chat_audio: mute (bits: pulse 1, pulse 2, triangle, noise, DMC, cartridge), ms, label"); return; }
+    s_mute.on = ms > 0 && mask;
+    s_mute.mask = (uint8_t)mask;
+    s_mute.born = SDL_GetTicks();
+    s_mute.life = (uint32_t)clamp_ms(ms, 100, 600000);
+    snprintf(s_mute.label, sizeof(s_mute.label), "%s", label);
+    cyc_tcp_ok(id, NULL);
+}
+
+/* Rewind: `on` keeps a snapshot every half second (the last twelve seconds);
+ * `seconds` goes back that far (as far as the snapshots reach). */
+static void tcp_rewind(int id, const char *line)
+{
+    bool on;
+    if (cyc_tcp_bool(line, "on", &on)) {
+        s_rewind_on = on;
+        if (!on) rewind_clear();
+    }
+    long seconds = 0;
+    cyc_tcp_long(line, "seconds", &seconds);
+    char f[96];
+    if (seconds > 0) {
+        if (online()) { cyc_tcp_err(id, "chat_rewind: not during online play"); return; }
+        long back = seconds * 60;
+        int i = s_rewind_count - 1;
+        while (i > 0 && s_rewind_frames - s_rewind[i].frame < back) --i;
+        if (i < 0) { cyc_tcp_err(id, s_rewind_on ? "chat_rewind: nothing recorded yet" : "chat_rewind: switch it on first (on true)"); return; }
+        char err[160];
+        long went = (s_rewind_frames - s_rewind[i].frame) / 60;
+        if (!state_apply(s_rewind[i].data, s_rewind[i].len, err, sizeof(err))) { cyc_tcp_err(id, err); return; }
+        for (int k = i + 1; k < s_rewind_count; ++k) snap_free(&s_rewind[k].data);
+        s_rewind_count = i + 1;
+        s_rewind_frames = s_rewind[i].frame;
+        snprintf(f, sizeof(f), "\"on\":%s,\"went_back_s\":%ld", s_rewind_on ? "true" : "false", went);
+    } else {
+        long reach = s_rewind_count ? (s_rewind_frames - s_rewind[0].frame) / 60 : 0;
+        snprintf(f, sizeof(f), "\"on\":%s,\"reach_s\":%ld", s_rewind_on ? "true" : "false", reach);
+    }
+    cyc_tcp_ok(id, f);
+}
+
+/* One checkpoint chat can come back to: do save | load. */
+static void tcp_checkpoint(int id, const char *line)
+{
+    char what[16] = "", err[160];
+    cyc_tcp_str(line, "do", what, sizeof(what));
+    if (online()) { cyc_tcp_err(id, "chat_checkpoint: not during online play"); return; }
+    if (!strcmp(what, "save")) {
+        uint8_t *data;
+        size_t len;
+        if (!cyc_state_save(&data, &len, err, sizeof(err))) { cyc_tcp_err(id, err); return; }
+        snap_free(&s_checkpoint.data);
+        s_checkpoint.data = data;
+        s_checkpoint.len = len;
+    } else if (!strcmp(what, "load")) {
+        if (!s_checkpoint.data) { cyc_tcp_err(id, "chat_checkpoint: none saved"); return; }
+        if (!state_apply(s_checkpoint.data, s_checkpoint.len, err, sizeof(err))) { cyc_tcp_err(id, err); return; }
+        rewind_clear();
+    } else {
+        cyc_tcp_err(id, "chat_checkpoint: do save|load");
+        return;
+    }
+    cyc_tcp_ok(id, NULL);
+}
+
+/* What is running: the ROM file the window opened and the PRG hash the
+ * compiled program was made from, for a bridge to pick its game file. */
+static void tcp_rom_info(int id, const char *line)
+{
+    (void)line;
+    char q[1100], f[1300];
+    cyc_tcp_quote(s_host.rom_path ? s_host.rom_path() : "", q, sizeof(q));
+    snprintf(f, sizeof(f), "\"rom\":%s,\"prg_fnv1a\":\"%08X\"", q, (unsigned)cyc_prg_hash());
     cyc_tcp_ok(id, f);
 }
 
@@ -356,6 +767,8 @@ static void tcp_clear(int id, const char *line)
     s_poll.count = 0;
     memset(s_pad, 0, sizeof(s_pad));
     memset(s_ram, 0, sizeof(s_ram));
+    memset(s_fx, 0, sizeof(s_fx));
+    s_speed.on = s_stop.on = s_mute.on = false;
     cyc_tcp_ok(id, NULL);
 }
 
@@ -382,6 +795,12 @@ void cyc_chat_register_tcp(void)
     cyc_tcp_register("chat_poll", "a poll over the game: title, options a|b|c, votes 1|0|2, ms, countdown, winner, y (%)", tcp_poll);
     cyc_tcp_register("chat_pad", "player 1 input effect: buttons, mode press|tap|block|invert, frames, label", tcp_pad);
     cyc_tcp_register("chat_ram", "RAM effect: addr, set|add|or|and, min, max, frames, every, if_addr, if_eq, label", tcp_ram);
+    cyc_tcp_register("chat_fx", "a picture effect: effect, ms, amount, color, x, y, label", tcp_fx);
+    cyc_tcp_register("chat_time", "the clock: mode speed (percent) | stop, ms, label", tcp_time);
+    cyc_tcp_register("chat_audio", "mute channels: mute (bit mask), ms, label", tcp_audio);
+    cyc_tcp_register("chat_rewind", "snapshots for rewinding: on, seconds", tcp_rewind);
+    cyc_tcp_register("chat_checkpoint", "one checkpoint: do save|load", tcp_checkpoint);
+    cyc_tcp_register("rom_info", "the ROM file and PRG hash running", tcp_rom_info);
     cyc_tcp_register("chat_call", "run a routine of the program now and keep its RAM effects: addr, a, x, y", tcp_call);
     cyc_tcp_register("chat_config", "the chat panel: show, side left|right, valign top|bottom, offset (% of height), lines, ms, scale", tcp_config);
     cyc_tcp_register("chat_clear", "drop chat lines, the banner and every chat effect", tcp_clear);
@@ -507,24 +926,39 @@ static void draw_panel(uint32_t now, int lw, int lh)
     }
 }
 
-static void draw_effects(int lw)
+#define TIMERS_MAX 16
+
+/* Every labelled effect running, as "LABEL 12s": frame-counted ones (input,
+ * RAM) and wall-clock ones (picture, clock, sound). */
+static int timers(uint32_t now, char rows[TIMERS_MAX][64])
 {
-    int y = 4;
-    for (int pass = 0; pass < 2; ++pass)
-        for (int i = 0; i < (pass ? RAM_MAX : PAD_MAX); ++i) {
-            bool on = pass ? s_ram[i].on : s_pad[i].on;
-            const char *label = pass ? s_ram[i].label : s_pad[i].label;
-            long left = pass ? s_ram[i].left : s_pad[i].left;
-            if (!on || !label[0]) continue;
-            char row[64];
-            int n = snprintf(row, sizeof(row), "%s %lds", label, (left + 59) / 60);
-            if (n < 0) continue;
-            if (n >= (int)sizeof(row)) n = (int)sizeof(row) - 1;
-            int x = lw - 6 - n * 8;
-            box(x - 3, y - 2, n * 8 + 6, LINE_H + 2, 0x241A04, 190);
-            text(x, y, 1, row, n, 0xFFD25A, 255, false);
-            y += LINE_H + 3;
-        }
+    int n = 0;
+    for (int i = 0; i < PAD_MAX && n < TIMERS_MAX; ++i)
+        if (s_pad[i].on && s_pad[i].label[0]) snprintf(rows[n++], 64, "%s %lds", s_pad[i].label, (s_pad[i].left + 59) / 60);
+    for (int i = 0; i < RAM_MAX && n < TIMERS_MAX; ++i)
+        if (s_ram[i].on && s_ram[i].label[0]) snprintf(rows[n++], 64, "%s %lds", s_ram[i].label, (s_ram[i].left + 59) / 60);
+    typedef struct { bool on; const char *label; uint32_t born, life; } Clocked;
+    Clocked clock[FX_KINDS + 3];
+    int c = 0;
+    for (int k = 0; k < FX_KINDS; ++k) clock[c++] = (Clocked){ s_fx[k].on, s_fx[k].label, s_fx[k].born, s_fx[k].life };
+    clock[c++] = (Clocked){ s_speed.on, s_speed.label, s_speed.born, s_speed.life };
+    clock[c++] = (Clocked){ s_stop.on, s_stop.label, s_stop.born, s_stop.life };
+    clock[c++] = (Clocked){ s_mute.on, s_mute.label, s_mute.born, s_mute.life };
+    for (int i = 0; i < c && n < TIMERS_MAX; ++i)
+        if (clock[i].on && clock[i].label[0] && live(now, clock[i].born, clock[i].life))
+            snprintf(rows[n++], 64, "%s %us", clock[i].label, (unsigned)((clock[i].life - (now - clock[i].born) + 999) / 1000));
+    return n;
+}
+
+static void draw_effects(uint32_t now, int lw)
+{
+    char rows[TIMERS_MAX][64];
+    int count = timers(now, rows), y = 4;
+    for (int i = 0; i < count; ++i, y += LINE_H + 3) {
+        int n = (int)strlen(rows[i]), x = lw - 6 - n * 8;
+        box(x - 3, y - 2, n * 8 + 6, LINE_H + 2, 0x241A04, 190);
+        text(x, y, 1, rows[i], n, 0xFFD25A, 255, false);
+    }
 }
 
 static void draw_banner(uint32_t now, int lw, int lh)
@@ -575,10 +1009,8 @@ static bool anything(uint32_t now)
 {
     if (s_banner.life && now - s_banner.born < s_banner.life) return true;
     if (s_poll.life && s_poll.count && now - s_poll.born < s_poll.life) return true;
-    for (int i = 0; i < PAD_MAX; ++i)
-        if (s_pad[i].on && s_pad[i].label[0]) return true;
-    for (int i = 0; i < RAM_MAX; ++i)
-        if (s_ram[i].on && s_ram[i].label[0]) return true;
+    char rows[TIMERS_MAX][64];
+    if (timers(now, rows)) return true;
     if (!s_cfg.show) return false;
     for (int i = 0; i < s_msg_count; ++i)
         if (now - s_msg[i].born < s_msg[i].life) return true;
@@ -613,7 +1045,7 @@ void cyc_chat_draw(SDL_Renderer *ren)
     }
     memset(s_px, 0, need * 4);
     if (s_cfg.show) draw_panel(now, lw, lh);
-    draw_effects(lw);
+    draw_effects(now, lw);
     draw_poll(now, lw, lh);
     draw_banner(now, lw, lh);
     SDL_UpdateTexture(s_tex, NULL, s_px, lw * 4);

@@ -333,6 +333,11 @@ void apu_debug_dmc(ApuDmcView *v)
     v->dma = apu.dmc_dma;
 }
 
+/* Output only (cyc_audio_mute): the channels keep running, unheard. */
+static uint8_t s_output_mute;
+
+void cyc_audio_mute(uint8_t mask) { s_output_mute = mask; }
+
 static void audio_cycle(void)
 {
     /* Timers: the pulse channels' count APU cycles, the others CPU cycles. */
@@ -367,9 +372,11 @@ static void audio_cycle(void)
 
     uint8_t out[5];
     apu_channel_levels(out);
+    for (int ch = 0; ch < 5; ch++)
+        if (s_output_mute >> ch & 1) out[ch] = 0;
     double level = audio.pulse_mix[out[0] + out[1]] + audio.tnd_mix[3 * out[2] + 2 * out[3] + out[4]];
 
-    level += hw_cart_audio_level();
+    if (!(s_output_mute & 0x20)) level += hw_cart_audio_level();
     audio.acc += level;
     audio.count++;
     audio.phase += 1.0;

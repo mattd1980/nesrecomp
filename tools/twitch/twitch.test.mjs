@@ -1,11 +1,15 @@
 // node --test tools/twitch/
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { buttons, compileProfile, createEngine, nameColor, printable } from './engine.mjs';
+import { buttons, compileProfile, createEngine, layerProfile, nameColor, printable } from './engine.mjs';
+import { identify, loadGames, romHashes } from './identify.mjs';
 import { chatMessage, parseIrcLine } from './irc.mjs';
+import { semantic } from './library/semantic.mjs';
+import { universal } from './library/universal.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -37,11 +41,59 @@ test('chat text is reduced to what the in-game font draws', () => {
   assert.equal(nameColor({ color: '#FFD700', login: 'x' }), 'FFD700');
 });
 
-test('every bundled profile compiles', () => {
-  for (const f of fs.readdirSync(path.join(here, 'profiles'))) {
-    const p = compileProfile(JSON.parse(fs.readFileSync(path.join(here, 'profiles', f), 'utf8')));
-    assert.ok(p.commands.size > 0, f);
+test('an unknown game gets the universal library alone; every game file compiles over both libraries', () => {
+  const bare = compileProfile(layerProfile([universal, semantic]));
+  assert.ok(bare.commands.has('flip') && bare.commands.has('rewind') && bare.commands.has('reverse'));
+  assert.ok(!bare.commands.has('heal') && !bare.commands.has('oneup'), 'semantic commands need their vars');
+  for (const { file, game } of loadGames([path.join(here, 'games')])) {
+    const p = compileProfile(layerProfile([universal, semantic, game]));
+    assert.ok(p.commands.size > bare.commands.size, file);
+    for (const n of p.vote.pool) assert.ok(p.commands.get(n).votable, `${file}: ${n}`);
   }
+});
+
+test('vars: one command, the game file says where and how the number is kept', () => {
+  const game = {
+    vars: {
+      health: { addr: '$A2', base: '0x80', max: 28, step: 4 },
+      timer: { addr: '$07F8', enc: 'digits', len: 3, max: 999 },
+      coins: [{ addr: '$075E', max: 99 }, { addr: '$07ED', enc: 'digits', len: 2 }],
+    },
+  };
+  const p = compileProfile(layerProfile([universal, semantic, game]));
+  const steps = (n) => p.commands.get(n).variants[0].steps;
+  assert.deepEqual(steps('heal'), [['chat_ram', { addr: 0xa2, enc: 'bin', len: 1, set: 0x9c, min: 0x80, max: 0x9c }]]);
+  assert.deepEqual(steps('hurt')[0][1], { addr: 0xa2, enc: 'bin', len: 1, add: -4, min: 0x81, max: 0x9c });
+  assert.deepEqual(steps('hurry')[0][1], { addr: 0x7f8, enc: 'digits', len: 3, add: -100, min: 100, max: 999 });
+  assert.deepEqual(steps('rich').map(([, f]) => [f.addr, f.enc, f.add, f.max]), [[0x75e, 'bin', 10, 99], [0x7ed, 'digits', 10, 99]]);
+  assert.equal(p.commands.has('oneup'), false); // no lives var
+});
+
+test('layers: a game file replaces a library command, settings disable and tweak', () => {
+  const game = { commands: { jump: { title: 'HOP HOP', steps: [{ pad: { buttons: 'a', frames: 5 } }] } } };
+  const settings = { disable: ['glitch', 'flip'], tweak: { shake: { cooldown_ms: 1234 } }, vote: { mode: 'vote' } };
+  const p = compileProfile(layerProfile([universal, semantic, game, settings]));
+  assert.equal(p.commands.get('jump').title, 'HOP HOP');
+  assert.equal(p.commands.has('glitch') || p.commands.has('flip'), false);
+  assert.equal(p.aliases.has('mirror'), false, 'an alias of a disabled command goes with it');
+  assert.equal(p.commands.get('shake').cooldownMs, 1234);
+  assert.equal(p.vote.mode, 'vote');
+});
+
+test('a ROM is known by No-Intro hashes of its body, whatever its header says', () => {
+  const body = Buffer.from('NES game body bytes');
+  const header = Buffer.from([0x4e, 0x45, 0x53, 0x1a, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'twitch-id-'));
+  const rom = path.join(dir, 'x.nes');
+  fs.writeFileSync(rom, Buffer.concat([header, body]));
+  const h = romHashes(fs.readFileSync(rom));
+  assert.equal(h.crc32, romHashes(body).crc32);
+  const games = [{ file: 'a.json', game: { name: 'A', match: { crc32: ['00000000'] } } },
+    { file: 'b.json', game: { name: 'B', match: { crc32: [h.crc32.toLowerCase()] } } }];
+  assert.equal(identify({ rom, prg_fnv1a: '1234ABCD' }, games).entry.game.name, 'B');
+  assert.equal(identify({ rom: '', prg_fnv1a: '1234abcd' }, [{ file: 'c', game: { name: 'C', match: { prg_fnv1a: ['1234ABCD'] } } }]).entry.game.name, 'C');
+  assert.equal(identify({ rom, prg_fnv1a: '' }, games.slice(0, 1)).entry, null);
+  fs.rmSync(dir, { recursive: true });
 });
 
 // A fake window: RAM for read_ram, a log of every request.
